@@ -53,8 +53,7 @@ PER_POSITION_PROFIT_PCT = float(
     os.environ.get("PER_POSITION_PROFIT_PCT", "20")
 )
 
-# Close all positions when combined unrealized profit
-# reaches this amount
+# Close all positions when combined unrealized profit reaches this amount
 PORTFOLIO_PROFIT_USD = float(
     os.environ.get("PORTFOLIO_PROFIT_USD", "15")
 )
@@ -74,8 +73,8 @@ WUNDER_API_SECRET = os.environ.get("WUNDER_API_SECRET")
 WUNDER_BASE_URL = "https://wundertrading.com"
 WUNDER_RECV_WINDOW = "60000"
 
-# These are already in Railway.
-# They are NOT used to place trades yet.
+# Master values already created in Railway
+# Not used to place trades yet
 WT_MASTER_AMOUNT = float(
     os.environ.get("WT_MASTER_AMOUNT", "50")
 )
@@ -382,7 +381,8 @@ def get_wunder_strategy(
 
 def get_wunder_profiles():
 
-    path = "/open_api/api-profiles"
+    # CORRECT ENDPOINT
+    path = "/open_api/api_profiles"
 
     status_code, data = wunder_request(
         "GET",
