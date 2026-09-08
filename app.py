@@ -20,8 +20,16 @@ from binance.enums import (
     ORDER_TYPE_MARKET,
 )
 
+# =========================================================
+# LOGGING
+# =========================================================
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("profit-monitor")
+
+# =========================================================
+# FLASK
+# =========================================================
 
 app = Flask(__name__)
 
@@ -40,14 +48,18 @@ POLL_INTERVAL_SECONDS = int(
     os.environ.get("POLL_INTERVAL_SECONDS", "15")
 )
 
+# Close individual position when ROI reaches this level
 PER_POSITION_PROFIT_PCT = float(
     os.environ.get("PER_POSITION_PROFIT_PCT", "20")
 )
 
+# Close all positions when combined unrealized profit
+# reaches this amount
 PORTFOLIO_PROFIT_USD = float(
     os.environ.get("PORTFOLIO_PROFIT_USD", "15")
 )
 
+# When position ROI reaches this %, move SL to entry price
 BREAKEVEN_TRIGGER_ROI_PCT = float(
     os.environ.get("BREAKEVEN_TRIGGER_ROI_PCT", "10")
 )
@@ -62,8 +74,18 @@ WUNDER_API_SECRET = os.environ.get("WUNDER_API_SECRET")
 WUNDER_BASE_URL = "https://wundertrading.com"
 WUNDER_RECV_WINDOW = "60000"
 
+# These are already in Railway.
+# They are NOT used to place trades yet.
+WT_MASTER_AMOUNT = float(
+    os.environ.get("WT_MASTER_AMOUNT", "50")
+)
+
+WT_MASTER_LEVERAGE = int(
+    os.environ.get("WT_MASTER_LEVERAGE", "16")
+)
+
 # =========================================================
-# WARNINGS
+# CONFIG WARNINGS
 # =========================================================
 
 if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -109,7 +131,7 @@ wunder_status = {
 }
 
 # =========================================================
-# WUNDERTRADING AUTH
+# WUNDERTRADING AUTHENTICATION
 # =========================================================
 
 def generate_wunder_signature(
@@ -141,7 +163,11 @@ def generate_wunder_signature(
 # WUNDERTRADING REQUEST
 # =========================================================
 
-def wunder_request(method, path, body=None):
+def wunder_request(
+    method,
+    path,
+    body=None,
+):
 
     if not WUNDER_API_KEY or not WUNDER_API_SECRET:
         raise RuntimeError(
@@ -194,6 +220,7 @@ def wunder_request(method, path, body=None):
     )
 
     try:
+
         with urllib.request.urlopen(
             request,
             timeout=15,
@@ -206,7 +233,9 @@ def wunder_request(method, path, body=None):
                 try:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
-                    data = {"raw": raw}
+                    data = {
+                        "raw": raw
+                    }
             else:
                 data = None
 
@@ -220,15 +249,20 @@ def wunder_request(method, path, body=None):
         )
 
         try:
-            error_data = json.loads(error_body)
+            error_data = json.loads(
+                error_body
+            )
         except Exception:
-            error_data = {"raw": error_body}
+            error_data = {
+                "raw": error_body
+            }
 
         raise RuntimeError(
             f"WunderTrading HTTP {e.code}: {error_data}"
         )
 
     except urllib.error.URLError as e:
+
         raise RuntimeError(
             f"WunderTrading connection error: {e}"
         )
@@ -242,6 +276,7 @@ def test_wunder_connection():
     path = "/open_api/strategies/live"
 
     try:
+
         status_code, data = wunder_request(
             "GET",
             path,
@@ -258,12 +293,14 @@ def test_wunder_connection():
         )
 
         if isinstance(data, list):
+
             result_info = {
                 "response_type": "list",
                 "items_returned": len(data),
             }
 
         elif isinstance(data, dict):
+
             result_info = {
                 "response_type": "object",
                 "top_level_keys": list(
@@ -272,11 +309,17 @@ def test_wunder_connection():
             }
 
         else:
+
             result_info = {
                 "response_type": type(
                     data
                 ).__name__,
             }
+
+        log.info(
+            "WunderTrading connection successful | HTTP %s",
+            status_code,
+        )
 
         return {
             "success": True,
@@ -293,6 +336,7 @@ def test_wunder_connection():
             WUNDER_API_KEY
             and WUNDER_API_SECRET
         )
+
         wunder_status["connected"] = False
         wunder_status["last_test"] = time.time()
         wunder_status["http_status"] = None
@@ -311,7 +355,9 @@ def test_wunder_connection():
 # READ ONE WUNDERTRADING STRATEGY
 # =========================================================
 
-def get_wunder_strategy(strategy_id):
+def get_wunder_strategy(
+    strategy_id
+):
 
     path = (
         f"/open_api/strategies/"
@@ -331,7 +377,26 @@ def get_wunder_strategy(strategy_id):
     }
 
 # =========================================================
-# BINANCE HELPERS
+# READ WUNDERTRADING API PROFILES
+# =========================================================
+
+def get_wunder_profiles():
+
+    path = "/open_api/api-profiles"
+
+    status_code, data = wunder_request(
+        "GET",
+        path,
+    )
+
+    return {
+        "success": True,
+        "http_status": status_code,
+        "data": data,
+    }
+
+# =========================================================
+# HELPERS
 # =========================================================
 
 def position_key(p):
@@ -349,21 +414,26 @@ def position_key(p):
 def get_tick_size(symbol):
 
     try:
+
         info = client.futures_exchange_info()
 
         for s in info["symbols"]:
+
             if s["symbol"] == symbol:
 
                 for f in s["filters"]:
+
                     if (
                         f["filterType"]
                         == "PRICE_FILTER"
                     ):
+
                         return float(
                             f["tickSize"]
                         )
 
     except Exception:
+
         log.exception(
             "Failed to get tick size for %s",
             symbol,
@@ -381,17 +451,28 @@ def round_price_to_tick(
     if not tick_size:
         return price
 
-    price_decimal = Decimal(str(price))
-    tick_decimal = Decimal(str(tick_size))
+    price_decimal = Decimal(
+        str(price)
+    )
 
-    ticks = price_decimal / tick_decimal
+    tick_decimal = Decimal(
+        str(tick_size)
+    )
+
+    ticks = (
+        price_decimal
+        / tick_decimal
+    )
 
     if side == SIDE_SELL:
+
         rounded_ticks = ticks.quantize(
             Decimal("1"),
             rounding=ROUND_DOWN,
         )
+
     else:
+
         rounded_ticks = ticks.quantize(
             Decimal("1"),
             rounding=ROUND_UP,
@@ -402,7 +483,9 @@ def round_price_to_tick(
         * tick_decimal
     )
 
-    return float(rounded_price)
+    return float(
+        rounded_price
+    )
 
 # =========================================================
 # CLOSE POSITION
@@ -422,6 +505,7 @@ def close_position(
     )
 
     try:
+
         params = {
             "symbol": symbol,
             "side": close_side,
@@ -429,10 +513,19 @@ def close_position(
             "quantity": abs(position_amt),
         }
 
+        # One-way mode
         if position_side == "BOTH":
-            params["reduceOnly"] = True
+
+            params[
+                "reduceOnly"
+            ] = True
+
+        # Hedge mode
         else:
-            params["positionSide"] = position_side
+
+            params[
+                "positionSide"
+            ] = position_side
 
         order = client.futures_create_order(
             **params
@@ -448,6 +541,7 @@ def close_position(
         return order
 
     except Exception:
+
         log.exception(
             "Failed to close %s",
             symbol,
@@ -462,35 +556,54 @@ def close_position(
 def position_margin(p):
 
     isolated = (
-        p.get("isolated", False)
+        p.get(
+            "isolated",
+            False,
+        )
         if "isolated" in p
         else
-        p.get("marginType") == "isolated"
+        p.get(
+            "marginType"
+        ) == "isolated"
     )
 
     leverage = float(
-        p.get("leverage", 1) or 1
+        p.get(
+            "leverage",
+            1,
+        )
+        or 1
     )
 
     notional = abs(
         float(
-            p.get("notional", 0)
+            p.get(
+                "notional",
+                0,
+            )
         )
         or (
-            float(p["positionAmt"])
-            * float(p["markPrice"])
+            float(
+                p["positionAmt"]
+            )
+            *
+            float(
+                p["markPrice"]
+            )
         )
     )
 
     if (
         isolated
-        and float(
+        and
+        float(
             p.get(
                 "isolatedMargin",
                 0,
             )
         ) > 0
     ):
+
         return float(
             p["isolatedMargin"]
         )
@@ -504,7 +617,7 @@ def position_margin(p):
     )
 
 # =========================================================
-# CANCEL OLD STOP LOSS
+# CANCEL EXISTING STOP LOSSES
 # =========================================================
 
 def cancel_existing_stop_losses(
@@ -514,6 +627,7 @@ def cancel_existing_stop_losses(
 ):
 
     try:
+
         orders = client.futures_get_open_orders(
             symbol=symbol
         )
@@ -527,7 +641,9 @@ def cancel_existing_stop_losses(
                 )
             ).upper()
 
-            order_side = order.get("side")
+            order_side = order.get(
+                "side"
+            )
 
             order_position_side = order.get(
                 "positionSide",
@@ -554,28 +670,36 @@ def cancel_existing_stop_losses(
             ]
 
             correct_side = (
-                order_side == close_side
+                order_side
+                == close_side
             )
 
             correct_position = (
                 position_side == "BOTH"
-                or order_position_side
+                or
+                order_position_side
                 == position_side
             )
 
             is_protective = (
                 reduce_only
-                or close_position_flag
+                or
+                close_position_flag
             )
 
             if (
                 is_stop
-                and correct_side
-                and correct_position
-                and is_protective
+                and
+                correct_side
+                and
+                correct_position
+                and
+                is_protective
             ):
 
-                order_id = order["orderId"]
+                order_id = (
+                    order["orderId"]
+                )
 
                 client.futures_cancel_order(
                     symbol=symbol,
@@ -590,9 +714,10 @@ def cancel_existing_stop_losses(
                 )
 
     except Exception:
+
         log.exception(
-            "Failed checking/cancelling "
-            "existing stop loss for %s",
+            "Failed checking/cancelling existing "
+            "stop loss for %s",
             symbol,
         )
 
@@ -625,23 +750,48 @@ def move_stop_to_breakeven(p):
         return False
 
     if entry_price <= 0:
+
+        log.warning(
+            "%s has invalid entry price: %s",
+            symbol,
+            entry_price,
+        )
+
         return False
 
+    # LONG
     if position_amt > 0:
 
         close_side = SIDE_SELL
 
         if mark_price <= entry_price:
+
+            log.warning(
+                "%s returned to/below breakeven "
+                "before SL could be armed.",
+                symbol,
+            )
+
             return False
 
+    # SHORT
     else:
 
         close_side = SIDE_BUY
 
         if mark_price >= entry_price:
+
+            log.warning(
+                "%s returned to/above breakeven "
+                "before SL could be armed.",
+                symbol,
+            )
+
             return False
 
-    tick_size = get_tick_size(symbol)
+    tick_size = get_tick_size(
+        symbol
+    )
 
     stop_price = round_price_to_tick(
         entry_price,
@@ -662,14 +812,23 @@ def move_stop_to_breakeven(p):
             "side": close_side,
             "type": "STOP_MARKET",
             "stopPrice": stop_price,
-            "quantity": abs(position_amt),
+            "quantity": abs(
+                position_amt
+            ),
             "workingType": "MARK_PRICE",
         }
 
         if position_side == "BOTH":
-            params["reduceOnly"] = True
+
+            params[
+                "reduceOnly"
+            ] = True
+
         else:
-            params["positionSide"] = position_side
+
+            params[
+                "positionSide"
+            ] = position_side
 
         client.futures_create_order(
             **params
@@ -677,7 +836,9 @@ def move_stop_to_breakeven(p):
 
         log.info(
             "BREAKEVEN ARMED %s | "
-            "Entry %.8f | Stop %.8f | Mark %.8f",
+            "Entry %.8f | "
+            "Stop %.8f | "
+            "Mark %.8f",
             symbol,
             entry_price,
             stop_price,
@@ -687,6 +848,7 @@ def move_stop_to_breakeven(p):
         return True
 
     except Exception:
+
         log.exception(
             "Failed moving %s stop to breakeven",
             symbol,
@@ -701,15 +863,18 @@ def move_stop_to_breakeven(p):
 def check_positions():
 
     try:
+
         positions = (
             client
             .futures_position_information()
         )
 
     except Exception:
+
         log.exception(
             "Failed to fetch positions"
         )
+
         return
 
     open_positions = [
@@ -728,7 +893,9 @@ def check_positions():
     for key in list(
         breakeven_armed.keys()
     ):
+
         if key not in active_keys:
+
             breakeven_armed.pop(
                 key,
                 None,
@@ -761,21 +928,42 @@ def check_positions():
 
         key = position_key(p)
 
+        # =================================================
+        # RULE 1:
+        # BREAKEVEN
+        # =================================================
+
         if (
             roi_pct
             >= BREAKEVEN_TRIGGER_ROI_PCT
-            and not breakeven_armed.get(
+            and
+            not breakeven_armed.get(
                 key,
                 False,
             )
         ):
+
+            log.info(
+                "%s reached %.2f%% ROI. "
+                "Breakeven trigger is %.2f%%.",
+                symbol,
+                roi_pct,
+                BREAKEVEN_TRIGGER_ROI_PCT,
+            )
 
             success = move_stop_to_breakeven(
                 p
             )
 
             if success:
-                breakeven_armed[key] = True
+
+                breakeven_armed[
+                    key
+                ] = True
+
+        # =================================================
+        # SNAPSHOT
+        # =================================================
 
         snapshot.append({
             "symbol": symbol,
@@ -802,10 +990,23 @@ def check_positions():
             ),
         })
 
+        # =================================================
+        # RULE 2:
+        # PER POSITION PROFIT
+        # =================================================
+
         if (
             roi_pct
             >= PER_POSITION_PROFIT_PCT
         ):
+
+            log.info(
+                "%s hit %.2f%% ROI "
+                "(threshold %.2f%%) — closing",
+                symbol,
+                roi_pct,
+                PER_POSITION_PROFIT_PCT,
+            )
 
             close_position(
                 symbol,
@@ -832,11 +1033,23 @@ def check_positions():
         "last_run"
     ] = time.time()
 
+    # =====================================================
+    # RULE 3:
+    # PORTFOLIO COMBINED PROFIT
+    # =====================================================
+
     if (
         total_unrealized
         >= PORTFOLIO_PROFIT_USD
         and open_positions
     ):
+
+        log.info(
+            "Portfolio combined profit "
+            "$%.2f >= $%.2f — closing all positions",
+            total_unrealized,
+            PORTFOLIO_PROFIT_USD,
+        )
 
         for p in open_positions:
 
@@ -880,9 +1093,11 @@ def monitor_loop():
     while True:
 
         try:
+
             check_positions()
 
         except Exception:
+
             log.exception(
                 "Unexpected monitor-loop error"
             )
@@ -892,10 +1107,13 @@ def monitor_loop():
         )
 
 # =========================================================
-# WEB ENDPOINTS
+# WEB ENDPOINT - HEALTH
 # =========================================================
 
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"],
+)
 def health():
 
     return jsonify({
@@ -907,27 +1125,50 @@ def health():
         ),
     }), 200
 
+# =========================================================
+# WEB ENDPOINT - STATUS
+# =========================================================
 
-@app.route("/status", methods=["GET"])
+@app.route(
+    "/status",
+    methods=["GET"],
+)
 def status():
 
     return jsonify({
+
         "config": {
+
             "breakeven_trigger_roi_pct":
                 BREAKEVEN_TRIGGER_ROI_PCT,
+
             "per_position_profit_pct":
                 PER_POSITION_PROFIT_PCT,
+
             "portfolio_profit_usd":
                 PORTFOLIO_PROFIT_USD,
+
             "poll_interval_seconds":
                 POLL_INTERVAL_SECONDS,
+
+            "wt_master_amount":
+                WT_MASTER_AMOUNT,
+
+            "wt_master_leverage":
+                WT_MASTER_LEVERAGE,
         },
+
         "snapshot":
             latest_snapshot,
+
         "wundertrading":
             wunder_status,
+
     }), 200
 
+# =========================================================
+# WEB ENDPOINT - WUNDERTRADING TEST
+# =========================================================
 
 @app.route(
     "/wunder-test",
@@ -938,16 +1179,26 @@ def wunder_test():
     result = test_wunder_connection()
 
     if result.get("success"):
-        return jsonify(result), 200
 
-    return jsonify(result), 500
+        return jsonify(
+            result
+        ), 200
 
+    return jsonify(
+        result
+    ), 500
+
+# =========================================================
+# WEB ENDPOINT - READ STRATEGY
+# =========================================================
 
 @app.route(
     "/wunder-strategy/<strategy_id>",
     methods=["GET"],
 )
-def wunder_strategy(strategy_id):
+def wunder_strategy(
+    strategy_id
+):
 
     try:
 
@@ -973,6 +1224,36 @@ def wunder_strategy(strategy_id):
                 strategy_id,
             "message":
                 str(e),
+        }), 500
+
+# =========================================================
+# WEB ENDPOINT - READ API PROFILES
+# =========================================================
+
+@app.route(
+    "/wunder-profiles",
+    methods=["GET"],
+)
+def wunder_profiles():
+
+    try:
+
+        result = get_wunder_profiles()
+
+        return jsonify(
+            result
+        ), 200
+
+    except Exception as e:
+
+        log.exception(
+            "Failed reading WunderTrading "
+            "API profiles"
+        )
+
+        return jsonify({
+            "success": False,
+            "message": str(e),
         }), 500
 
 # =========================================================
