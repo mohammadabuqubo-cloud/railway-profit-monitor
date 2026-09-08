@@ -34,7 +34,7 @@ log = logging.getLogger("profit-monitor")
 app = Flask(__name__)
 
 # =========================================================
-# CONFIG - Railway Environment Variables
+# CONFIG - RAILWAY ENVIRONMENT VARIABLES
 # =========================================================
 
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY")
@@ -48,17 +48,14 @@ POLL_INTERVAL_SECONDS = int(
     os.environ.get("POLL_INTERVAL_SECONDS", "15")
 )
 
-# Close individual position when ROI reaches this level
 PER_POSITION_PROFIT_PCT = float(
     os.environ.get("PER_POSITION_PROFIT_PCT", "20")
 )
 
-# Close all positions when combined unrealized profit reaches this amount
 PORTFOLIO_PROFIT_USD = float(
     os.environ.get("PORTFOLIO_PROFIT_USD", "15")
 )
 
-# When position ROI reaches this %, move SL to entry price
 BREAKEVEN_TRIGGER_ROI_PCT = float(
     os.environ.get("BREAKEVEN_TRIGGER_ROI_PCT", "10")
 )
@@ -70,11 +67,17 @@ BREAKEVEN_TRIGGER_ROI_PCT = float(
 WUNDER_API_KEY = os.environ.get("WUNDER_API_KEY")
 WUNDER_API_SECRET = os.environ.get("WUNDER_API_SECRET")
 
+WUNDER_PROFILE_CODE = os.environ.get(
+    "WUNDER_PROFILE_CODE"
+)
+
 WUNDER_BASE_URL = "https://wundertrading.com"
 WUNDER_RECV_WINDOW = "60000"
 
-# Master values already created in Railway
-# Not used to place trades yet
+# =========================================================
+# MASTER TRADING CONFIG
+# =========================================================
+
 WT_MASTER_AMOUNT = float(
     os.environ.get("WT_MASTER_AMOUNT", "50")
 )
@@ -83,8 +86,19 @@ WT_MASTER_LEVERAGE = int(
     os.environ.get("WT_MASTER_LEVERAGE", "16")
 )
 
+WT_PAIRS_RAW = os.environ.get(
+    "WT_PAIRS",
+    ""
+)
+
+WT_PAIRS = [
+    pair.strip().upper()
+    for pair in WT_PAIRS_RAW.split(",")
+    if pair.strip()
+]
+
 # =========================================================
-# CONFIG WARNINGS
+# WARNINGS
 # =========================================================
 
 if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -95,6 +109,16 @@ if not BINANCE_API_KEY or not BINANCE_API_SECRET:
 if not WUNDER_API_KEY or not WUNDER_API_SECRET:
     log.warning(
         "WUNDER_API_KEY / WUNDER_API_SECRET not configured."
+    )
+
+if not WUNDER_PROFILE_CODE:
+    log.warning(
+        "WUNDER_PROFILE_CODE not configured."
+    )
+
+if not WT_PAIRS:
+    log.warning(
+        "WT_PAIRS is empty."
     )
 
 # =========================================================
@@ -121,7 +145,9 @@ breakeven_armed = {}
 
 wunder_status = {
     "configured": bool(
-        WUNDER_API_KEY and WUNDER_API_SECRET
+        WUNDER_API_KEY
+        and WUNDER_API_SECRET
+        and WUNDER_PROFILE_CODE
     ),
     "connected": False,
     "last_test": None,
@@ -140,6 +166,7 @@ def generate_wunder_signature(
     recv_window,
     body=""
 ):
+
     payload = "\n".join([
         method.upper(),
         path,
@@ -206,12 +233,17 @@ def wunder_request(
     request_data = None
 
     if body_string:
-        request_data = body_string.encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        request_data = body_string.encode(
+            "utf-8"
+        )
+
+        headers[
+            "Content-Type"
+        ] = "application/json"
 
     url = WUNDER_BASE_URL + path
 
-    request = urllib.request.Request(
+    req = urllib.request.Request(
         url=url,
         data=request_data,
         headers=headers,
@@ -221,20 +253,21 @@ def wunder_request(
     try:
 
         with urllib.request.urlopen(
-            request,
-            timeout=15,
+            req,
+            timeout=20,
         ) as response:
 
-            raw = response.read().decode("utf-8")
+            raw = response.read().decode(
+                "utf-8"
+            )
+
             status_code = response.status
 
             if raw:
                 try:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
-                    data = {
-                        "raw": raw
-                    }
+                    data = {"raw": raw}
             else:
                 data = None
 
@@ -267,7 +300,7 @@ def wunder_request(
         )
 
 # =========================================================
-# WUNDERTRADING CONNECTION TEST
+# WUNDERTRADING TEST
 # =========================================================
 
 def test_wunder_connection():
@@ -291,59 +324,16 @@ def test_wunder_connection():
             "WunderTrading API authentication successful"
         )
 
-        if isinstance(data, list):
-
-            result_info = {
-                "response_type": "list",
-                "items_returned": len(data),
-            }
-
-        elif isinstance(data, dict):
-
-            result_info = {
-                "response_type": "object",
-                "top_level_keys": list(
-                    data.keys()
-                )[:20],
-            }
-
-        else:
-
-            result_info = {
-                "response_type": type(
-                    data
-                ).__name__,
-            }
-
-        log.info(
-            "WunderTrading connection successful | HTTP %s",
-            status_code,
-        )
-
         return {
             "success": True,
             "http_status": status_code,
-            "message": (
-                "WunderTrading API authentication successful"
-            ),
-            "data_info": result_info,
         }
 
     except Exception as e:
 
-        wunder_status["configured"] = bool(
-            WUNDER_API_KEY
-            and WUNDER_API_SECRET
-        )
-
         wunder_status["connected"] = False
         wunder_status["last_test"] = time.time()
-        wunder_status["http_status"] = None
         wunder_status["message"] = str(e)
-
-        log.exception(
-            "WunderTrading connection test failed"
-        )
 
         return {
             "success": False,
@@ -351,37 +341,11 @@ def test_wunder_connection():
         }
 
 # =========================================================
-# READ ONE WUNDERTRADING STRATEGY
-# =========================================================
-
-def get_wunder_strategy(
-    strategy_id
-):
-
-    path = (
-        f"/open_api/strategies/"
-        f"{strategy_id}"
-    )
-
-    status_code, data = wunder_request(
-        "GET",
-        path,
-    )
-
-    return {
-        "success": True,
-        "http_status": status_code,
-        "strategy_id_requested": strategy_id,
-        "data": data,
-    }
-
-# =========================================================
-# READ WUNDERTRADING API PROFILES
+# WUNDER PROFILES
 # =========================================================
 
 def get_wunder_profiles():
 
-    # CORRECT ENDPOINT
     path = "/open_api/api_profiles"
 
     status_code, data = wunder_request(
@@ -396,7 +360,96 @@ def get_wunder_profiles():
     }
 
 # =========================================================
-# HELPERS
+# CREATE WUNDER TRADE
+# =========================================================
+
+def create_wunder_trade(
+    pair,
+    side,
+):
+
+    if side not in [
+        "long",
+        "short",
+    ]:
+        raise ValueError(
+            "Side must be long or short."
+        )
+
+    if pair not in WT_PAIRS:
+        raise ValueError(
+            f"{pair} is not configured in WT_PAIRS."
+        )
+
+    if WT_MASTER_AMOUNT <= 0:
+        raise ValueError(
+            "WT_MASTER_AMOUNT must be greater than zero."
+        )
+
+    # Set actual Binance Futures leverage
+    client.futures_change_leverage(
+        symbol=pair,
+        leverage=WT_MASTER_LEVERAGE,
+    )
+
+    log.info(
+        "Binance leverage set | %s | %sx",
+        pair,
+        WT_MASTER_LEVERAGE,
+    )
+
+    path = "/open_api/strategies/trade"
+
+    client_id = (
+        f"railway-{pair.lower()}-"
+        f"{side}-"
+        f"{int(time.time() * 1000)}"
+    )
+
+    if len(client_id) < 32:
+        client_id += (
+            "x"
+            * (
+                32
+                - len(client_id)
+            )
+        )
+
+    if len(client_id) > 64:
+        client_id = client_id[:64]
+
+    payload = {
+        "clientId": client_id,
+        "exchangeCode": "BINANCE_FUTURES",
+        "pairCode": pair,
+        "profilesCodes": [
+            WUNDER_PROFILE_CODE
+        ],
+        "side": side,
+        "orderType": "market",
+        "amountPerTrade": WT_MASTER_AMOUNT,
+        "amountPerTradeType": "quote",
+        "leverage": WT_MASTER_LEVERAGE,
+    }
+
+    status_code, data = wunder_request(
+        "POST",
+        path,
+        payload,
+    )
+
+    return {
+        "success": True,
+        "http_status": status_code,
+        "pair": pair,
+        "side": side,
+        "amount": WT_MASTER_AMOUNT,
+        "leverage": WT_MASTER_LEVERAGE,
+        "data": data,
+    }
+
+# =========================================================
+# BINANCE HELPERS
 # =========================================================
 
 def position_key(p):
@@ -478,13 +531,9 @@ def round_price_to_tick(
             rounding=ROUND_UP,
         )
 
-    rounded_price = (
+    return float(
         rounded_ticks
         * tick_decimal
-    )
-
-    return float(
-        rounded_price
     )
 
 # =========================================================
@@ -510,17 +559,17 @@ def close_position(
             "symbol": symbol,
             "side": close_side,
             "type": ORDER_TYPE_MARKET,
-            "quantity": abs(position_amt),
+            "quantity": abs(
+                position_amt
+            ),
         }
 
-        # One-way mode
         if position_side == "BOTH":
 
             params[
                 "reduceOnly"
             ] = True
 
-        # Hedge mode
         else:
 
             params[
@@ -617,7 +666,7 @@ def position_margin(p):
     )
 
 # =========================================================
-# CANCEL EXISTING STOP LOSSES
+# CANCEL STOP LOSS
 # =========================================================
 
 def cancel_existing_stop_losses(
@@ -664,10 +713,13 @@ def cancel_existing_stop_losses(
                 )
             )
 
-            is_stop = order_type in [
-                "STOP",
-                "STOP_MARKET",
-            ]
+            is_stop = (
+                order_type
+                in [
+                    "STOP",
+                    "STOP_MARKET",
+                ]
+            )
 
             correct_side = (
                 order_side
@@ -675,7 +727,8 @@ def cancel_existing_stop_losses(
             )
 
             correct_position = (
-                position_side == "BOTH"
+                position_side
+                == "BOTH"
                 or
                 order_position_side
                 == position_side
@@ -697,27 +750,17 @@ def cancel_existing_stop_losses(
                 is_protective
             ):
 
-                order_id = (
-                    order["orderId"]
-                )
-
                 client.futures_cancel_order(
                     symbol=symbol,
-                    orderId=order_id,
-                )
-
-                log.info(
-                    "Cancelled previous stop-loss "
-                    "%s orderId=%s",
-                    symbol,
-                    order_id,
+                    orderId=order[
+                        "orderId"
+                    ],
                 )
 
     except Exception:
 
         log.exception(
-            "Failed checking/cancelling existing "
-            "stop loss for %s",
+            "Failed cancelling stop loss for %s",
             symbol,
         )
 
@@ -750,43 +793,20 @@ def move_stop_to_breakeven(p):
         return False
 
     if entry_price <= 0:
-
-        log.warning(
-            "%s has invalid entry price: %s",
-            symbol,
-            entry_price,
-        )
-
         return False
 
-    # LONG
     if position_amt > 0:
 
         close_side = SIDE_SELL
 
         if mark_price <= entry_price:
-
-            log.warning(
-                "%s returned to/below breakeven "
-                "before SL could be armed.",
-                symbol,
-            )
-
             return False
 
-    # SHORT
     else:
 
         close_side = SIDE_BUY
 
         if mark_price >= entry_price:
-
-            log.warning(
-                "%s returned to/above breakeven "
-                "before SL could be armed.",
-                symbol,
-            )
-
             return False
 
     tick_size = get_tick_size(
@@ -837,12 +857,10 @@ def move_stop_to_breakeven(p):
         log.info(
             "BREAKEVEN ARMED %s | "
             "Entry %.8f | "
-            "Stop %.8f | "
-            "Mark %.8f",
+            "Stop %.8f",
             symbol,
             entry_price,
             stop_price,
-            mark_price,
         )
 
         return True
@@ -928,11 +946,6 @@ def check_positions():
 
         key = position_key(p)
 
-        # =================================================
-        # RULE 1:
-        # BREAKEVEN
-        # =================================================
-
         if (
             roi_pct
             >= BREAKEVEN_TRIGGER_ROI_PCT
@@ -943,14 +956,6 @@ def check_positions():
             )
         ):
 
-            log.info(
-                "%s reached %.2f%% ROI. "
-                "Breakeven trigger is %.2f%%.",
-                symbol,
-                roi_pct,
-                BREAKEVEN_TRIGGER_ROI_PCT,
-            )
-
             success = move_stop_to_breakeven(
                 p
             )
@@ -960,10 +965,6 @@ def check_positions():
                 breakeven_armed[
                     key
                 ] = True
-
-        # =================================================
-        # SNAPSHOT
-        # =================================================
 
         snapshot.append({
             "symbol": symbol,
@@ -990,28 +991,18 @@ def check_positions():
             ),
         })
 
-        # =================================================
-        # RULE 2:
-        # PER POSITION PROFIT
-        # =================================================
-
         if (
             roi_pct
             >= PER_POSITION_PROFIT_PCT
         ):
 
-            log.info(
-                "%s hit %.2f%% ROI "
-                "(threshold %.2f%%) — closing",
-                symbol,
-                roi_pct,
-                PER_POSITION_PROFIT_PCT,
-            )
-
             close_position(
                 symbol,
                 position_amt,
-                f"+{roi_pct:.2f}% margin ROI",
+                (
+                    f"+{roi_pct:.2f}% "
+                    f"margin ROI"
+                ),
                 p.get(
                     "positionSide",
                     "BOTH",
@@ -1033,23 +1024,12 @@ def check_positions():
         "last_run"
     ] = time.time()
 
-    # =====================================================
-    # RULE 3:
-    # PORTFOLIO COMBINED PROFIT
-    # =====================================================
-
     if (
         total_unrealized
         >= PORTFOLIO_PROFIT_USD
-        and open_positions
+        and
+        open_positions
     ):
-
-        log.info(
-            "Portfolio combined profit "
-            "$%.2f >= $%.2f — closing all positions",
-            total_unrealized,
-            PORTFOLIO_PROFIT_USD,
-        )
 
         for p in open_positions:
 
@@ -1093,11 +1073,9 @@ def monitor_loop():
     while True:
 
         try:
-
             check_positions()
 
         except Exception:
-
             log.exception(
                 "Unexpected monitor-loop error"
             )
@@ -1107,7 +1085,7 @@ def monitor_loop():
         )
 
 # =========================================================
-# WEB ENDPOINT - HEALTH
+# HEALTH
 # =========================================================
 
 @app.route(
@@ -1118,15 +1096,20 @@ def health():
 
     return jsonify({
         "status": "ok",
-        "service": "binance-profit-monitor",
-        "wundertrading_configured": bool(
-            WUNDER_API_KEY
-            and WUNDER_API_SECRET
-        ),
+        "service":
+            "binance-profit-monitor",
+        "wundertrading_configured":
+            bool(
+                WUNDER_API_KEY
+                and
+                WUNDER_API_SECRET
+                and
+                WUNDER_PROFILE_CODE
+            ),
     }), 200
 
 # =========================================================
-# WEB ENDPOINT - STATUS
+# STATUS
 # =========================================================
 
 @app.route(
@@ -1156,6 +1139,9 @@ def status():
 
             "wt_master_leverage":
                 WT_MASTER_LEVERAGE,
+
+            "wt_pairs":
+                WT_PAIRS,
         },
 
         "snapshot":
@@ -1167,7 +1153,7 @@ def status():
     }), 200
 
 # =========================================================
-# WEB ENDPOINT - WUNDERTRADING TEST
+# WUNDER TEST
 # =========================================================
 
 @app.route(
@@ -1178,7 +1164,9 @@ def wunder_test():
 
     result = test_wunder_connection()
 
-    if result.get("success"):
+    if result.get(
+        "success"
+    ):
 
         return jsonify(
             result
@@ -1189,45 +1177,7 @@ def wunder_test():
     ), 500
 
 # =========================================================
-# WEB ENDPOINT - READ STRATEGY
-# =========================================================
-
-@app.route(
-    "/wunder-strategy/<strategy_id>",
-    methods=["GET"],
-)
-def wunder_strategy(
-    strategy_id
-):
-
-    try:
-
-        result = get_wunder_strategy(
-            strategy_id
-        )
-
-        return jsonify(
-            result
-        ), 200
-
-    except Exception as e:
-
-        log.exception(
-            "Failed reading WunderTrading "
-            "strategy %s",
-            strategy_id,
-        )
-
-        return jsonify({
-            "success": False,
-            "strategy_id_requested":
-                strategy_id,
-            "message":
-                str(e),
-        }), 500
-
-# =========================================================
-# WEB ENDPOINT - READ API PROFILES
+# WUNDER PROFILES
 # =========================================================
 
 @app.route(
@@ -1238,7 +1188,36 @@ def wunder_profiles():
 
     try:
 
-        result = get_wunder_profiles()
+        return jsonify(
+            get_wunder_profiles()
+        ), 200
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "message": str(e),
+        }), 500
+
+# =========================================================
+# CREATE ONE TRADE
+# =========================================================
+
+@app.route(
+    "/trade/<pair>/<side>",
+    methods=["POST"],
+)
+def trade_pair(
+    pair,
+    side,
+):
+
+    try:
+
+        result = create_wunder_trade(
+            pair.upper(),
+            side.lower(),
+        )
 
         return jsonify(
             result
@@ -1247,8 +1226,7 @@ def wunder_profiles():
     except Exception as e:
 
         log.exception(
-            "Failed reading WunderTrading "
-            "API profiles"
+            "Trade failed"
         )
 
         return jsonify({
@@ -1257,7 +1235,7 @@ def wunder_profiles():
         }), 500
 
 # =========================================================
-# START BACKGROUND THREAD
+# START MONITOR
 # =========================================================
 
 _thread = threading.Thread(
