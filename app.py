@@ -45,19 +45,43 @@ USE_TESTNET = (
 )
 
 POLL_INTERVAL_SECONDS = int(
-    os.environ.get("POLL_INTERVAL_SECONDS", "15")
+    os.environ.get("POLL_INTERVAL_SECONDS", "5")
 )
 
-PER_POSITION_PROFIT_PCT = float(
-    os.environ.get("PER_POSITION_PROFIT_PCT", "20")
+# ---------------------------------------------------------
+# POSITION MANAGEMENT
+# ---------------------------------------------------------
+
+# Initial emergency stop:
+# Example: 20 means close/protect at approximately -20% ROI.
+INITIAL_STOP_LOSS_ROI_PCT = float(
+    os.environ.get("INITIAL_STOP_LOSS_ROI_PCT", "20")
 )
 
-PORTFOLIO_PROFIT_USD = float(
-    os.environ.get("PORTFOLIO_PROFIT_USD", "15")
-)
-
+# Once ROI reaches this value, stop moves to breakeven.
 BREAKEVEN_TRIGGER_ROI_PCT = float(
     os.environ.get("BREAKEVEN_TRIGGER_ROI_PCT", "10")
+)
+
+# First take-profit level.
+PARTIAL_TP_ROI_PCT = float(
+    os.environ.get("PARTIAL_TP_ROI_PCT", "20")
+)
+
+# Percentage of POSITION to close at first TP.
+PARTIAL_CLOSE_PCT = float(
+    os.environ.get("PARTIAL_CLOSE_PCT", "50")
+)
+
+# Final take-profit.
+FINAL_TP_ROI_PCT = float(
+    os.environ.get("FINAL_TP_ROI_PCT", "60")
+)
+
+# Close all positions when TOTAL floating PnL reaches this USD amount.
+# Set to 0 to disable.
+PORTFOLIO_PROFIT_USD = float(
+    os.environ.get("PORTFOLIO_PROFIT_USD", "0")
 )
 
 # =========================================================
@@ -141,7 +165,19 @@ latest_snapshot = {
     "last_run": None,
 }
 
-breakeven_armed = {}
+# State for each currently open position.
+#
+# Example:
+#
+# BTCUSDT:BOTH:
+# {
+#     "entry_price": 50000,
+#     "initial_stop_armed": True,
+#     "breakeven_armed": True,
+#     "partial_tp_done": True
+# }
+
+position_states = {}
 
 wunder_status = {
     "configured": bool(
@@ -184,6 +220,7 @@ def generate_wunder_signature(
     ).decode("utf-8")
 
     return signature
+
 
 # =========================================================
 # WUNDERTRADING REQUEST
@@ -233,13 +270,12 @@ def wunder_request(
     request_data = None
 
     if body_string:
+
         request_data = body_string.encode(
             "utf-8"
         )
 
-        headers[
-            "Content-Type"
-        ] = "application/json"
+        headers["Content-Type"] = "application/json"
 
     url = WUNDER_BASE_URL + path
 
@@ -299,6 +335,7 @@ def wunder_request(
             f"WunderTrading connection error: {e}"
         )
 
+
 # =========================================================
 # WUNDERTRADING TEST
 # =========================================================
@@ -318,8 +355,10 @@ def test_wunder_connection():
         wunder_status["connected"] = (
             status_code == 200
         )
+
         wunder_status["last_test"] = time.time()
         wunder_status["http_status"] = status_code
+
         wunder_status["message"] = (
             "WunderTrading API authentication successful"
         )
@@ -340,6 +379,7 @@ def test_wunder_connection():
             "message": str(e),
         }
 
+
 # =========================================================
 # WUNDER PROFILES
 # =========================================================
@@ -359,6 +399,7 @@ def get_wunder_profiles():
         "data": data,
     }
 
+
 # =========================================================
 # CREATE WUNDER TRADE
 # =========================================================
@@ -372,21 +413,24 @@ def create_wunder_trade(
         "long",
         "short",
     ]:
+
         raise ValueError(
             "Side must be long or short."
         )
 
     if pair not in WT_PAIRS:
+
         raise ValueError(
             f"{pair} is not configured in WT_PAIRS."
         )
 
     if WT_MASTER_AMOUNT <= 0:
+
         raise ValueError(
             "WT_MASTER_AMOUNT must be greater than zero."
         )
 
-    # Set actual Binance Futures leverage
+    # Set Binance Futures leverage
     client.futures_change_leverage(
         symbol=pair,
         leverage=WT_MASTER_LEVERAGE,
@@ -407,6 +451,7 @@ def create_wunder_trade(
     )
 
     if len(client_id) < 32:
+
         client_id += (
             "x"
             * (
@@ -416,6 +461,7 @@ def create_wunder_trade(
         )
 
     if len(client_id) > 64:
+
         client_id = client_id[:64]
 
     payload = {
@@ -448,8 +494,9 @@ def create_wunder_trade(
         "data": data,
     }
 
+
 # =========================================================
-# BINANCE HELPERS
+# POSITION KEY
 # =========================================================
 
 def position_key(p):
@@ -464,6 +511,10 @@ def position_key(p):
     return f"{symbol}:{position_side}"
 
 
+# =========================================================
+# TICK SIZE
+# =========================================================
+
 def get_tick_size(symbol):
 
     try:
@@ -476,10 +527,7 @@ def get_tick_size(symbol):
 
                 for f in s["filters"]:
 
-                    if (
-                        f["filterType"]
-                        == "PRICE_FILTER"
-                    ):
+                    if f["filterType"] == "PRICE_FILTER":
 
                         return float(
                             f["tickSize"]
@@ -494,6 +542,51 @@ def get_tick_size(symbol):
 
     return None
 
+
+# =========================================================
+# QUANTITY STEP SIZE
+# =========================================================
+
+def get_quantity_step_size(symbol):
+
+    try:
+
+        info = client.futures_exchange_info()
+
+        for s in info["symbols"]:
+
+            if s["symbol"] == symbol:
+
+                # Prefer MARKET_LOT_SIZE for market orders.
+                for f in s["filters"]:
+
+                    if f["filterType"] == "MARKET_LOT_SIZE":
+
+                        return float(
+                            f["stepSize"]
+                        )
+
+                for f in s["filters"]:
+
+                    if f["filterType"] == "LOT_SIZE":
+
+                        return float(
+                            f["stepSize"]
+                        )
+
+    except Exception:
+
+        log.exception(
+            "Failed to get quantity step size for %s",
+            symbol,
+        )
+
+    return None
+
+
+# =========================================================
+# ROUND PRICE
+# =========================================================
 
 def round_price_to_tick(
     price,
@@ -536,8 +629,259 @@ def round_price_to_tick(
         * tick_decimal
     )
 
+
 # =========================================================
-# CLOSE POSITION
+# ROUND QUANTITY
+# =========================================================
+
+def round_quantity_down(
+    quantity,
+    step_size,
+):
+
+    if not step_size:
+        return quantity
+
+    qty_decimal = Decimal(
+        str(quantity)
+    )
+
+    step_decimal = Decimal(
+        str(step_size)
+    )
+
+    steps = (
+        qty_decimal
+        / step_decimal
+    ).quantize(
+        Decimal("1"),
+        rounding=ROUND_DOWN,
+    )
+
+    return float(
+        steps
+        * step_decimal
+    )
+
+
+# =========================================================
+# POSITION MARGIN
+# =========================================================
+
+def position_margin(p):
+
+    # Binance may expose position initial margin directly.
+    for field in [
+        "positionInitialMargin",
+        "initialMargin",
+    ]:
+
+        try:
+
+            value = float(
+                p.get(
+                    field,
+                    0,
+                )
+                or 0
+            )
+
+            if value > 0:
+                return value
+
+        except Exception:
+            pass
+
+    # Fallback calculation.
+    leverage = float(
+        p.get(
+            "leverage",
+            1,
+        )
+        or 1
+    )
+
+    if leverage <= 0:
+        leverage = 1
+
+    notional = abs(
+        float(
+            p.get(
+                "notional",
+                0,
+            )
+            or 0
+        )
+    )
+
+    if notional <= 0:
+
+        notional = abs(
+            float(
+                p["positionAmt"]
+            )
+            * float(
+                p["markPrice"]
+            )
+        )
+
+    return (
+        notional
+        / leverage
+    )
+
+
+# =========================================================
+# CALCULATE ROI
+# =========================================================
+
+def calculate_roi_pct(p):
+
+    unrealized = float(
+        p.get(
+            "unRealizedProfit",
+            0,
+        )
+        or 0
+    )
+
+    margin = position_margin(p)
+
+    if margin <= 0:
+        return 0.0
+
+    return (
+        unrealized
+        / margin
+        * 100.0
+    )
+
+
+# =========================================================
+# GET CURRENT POSITION
+# =========================================================
+
+def get_current_position(
+    symbol,
+    position_side="BOTH",
+):
+
+    try:
+
+        positions = (
+            client
+            .futures_position_information(
+                symbol=symbol
+            )
+        )
+
+        for p in positions:
+
+            if (
+                p.get(
+                    "positionSide",
+                    "BOTH",
+                )
+                == position_side
+                and
+                float(
+                    p["positionAmt"]
+                ) != 0
+            ):
+
+                return p
+
+    except Exception:
+
+        log.exception(
+            "Failed to refresh position %s",
+            symbol,
+        )
+
+    return None
+
+
+# =========================================================
+# CLOSE POSITION QUANTITY
+# =========================================================
+
+def close_position_quantity(
+    symbol,
+    current_position_amt,
+    quantity,
+    reason,
+    position_side="BOTH",
+):
+
+    if quantity <= 0:
+        return None
+
+    close_side = (
+        SIDE_SELL
+        if current_position_amt > 0
+        else SIDE_BUY
+    )
+
+    step_size = get_quantity_step_size(
+        symbol
+    )
+
+    quantity = round_quantity_down(
+        abs(quantity),
+        step_size,
+    )
+
+    if quantity <= 0:
+
+        log.warning(
+            "Close quantity rounded to zero for %s",
+            symbol,
+        )
+
+        return None
+
+    try:
+
+        params = {
+            "symbol": symbol,
+            "side": close_side,
+            "type": ORDER_TYPE_MARKET,
+            "quantity": quantity,
+        }
+
+        if position_side == "BOTH":
+
+            params["reduceOnly"] = True
+
+        else:
+
+            params["positionSide"] = position_side
+
+        order = client.futures_create_order(
+            **params
+        )
+
+        log.info(
+            "CLOSED %s | Qty %.8f | %s",
+            symbol,
+            quantity,
+            reason,
+        )
+
+        return order
+
+    except Exception:
+
+        log.exception(
+            "Failed closing quantity for %s",
+            symbol,
+        )
+
+        return None
+
+
+# =========================================================
+# CLOSE ENTIRE POSITION
 # =========================================================
 
 def close_position(
@@ -547,126 +891,17 @@ def close_position(
     position_side="BOTH",
 ):
 
-    close_side = (
-        SIDE_SELL
-        if position_amt > 0
-        else SIDE_BUY
+    return close_position_quantity(
+        symbol=symbol,
+        current_position_amt=position_amt,
+        quantity=abs(position_amt),
+        reason=reason,
+        position_side=position_side,
     )
 
-    try:
-
-        params = {
-            "symbol": symbol,
-            "side": close_side,
-            "type": ORDER_TYPE_MARKET,
-            "quantity": abs(
-                position_amt
-            ),
-        }
-
-        if position_side == "BOTH":
-
-            params[
-                "reduceOnly"
-            ] = True
-
-        else:
-
-            params[
-                "positionSide"
-            ] = position_side
-
-        order = client.futures_create_order(
-            **params
-        )
-
-        log.info(
-            "Closed %s (%s): %s",
-            symbol,
-            reason,
-            order,
-        )
-
-        return order
-
-    except Exception:
-
-        log.exception(
-            "Failed to close %s",
-            symbol,
-        )
-
-        return None
 
 # =========================================================
-# POSITION MARGIN
-# =========================================================
-
-def position_margin(p):
-
-    isolated = (
-        p.get(
-            "isolated",
-            False,
-        )
-        if "isolated" in p
-        else
-        p.get(
-            "marginType"
-        ) == "isolated"
-    )
-
-    leverage = float(
-        p.get(
-            "leverage",
-            1,
-        )
-        or 1
-    )
-
-    notional = abs(
-        float(
-            p.get(
-                "notional",
-                0,
-            )
-        )
-        or (
-            float(
-                p["positionAmt"]
-            )
-            *
-            float(
-                p["markPrice"]
-            )
-        )
-    )
-
-    if (
-        isolated
-        and
-        float(
-            p.get(
-                "isolatedMargin",
-                0,
-            )
-        ) > 0
-    ):
-
-        return float(
-            p["isolatedMargin"]
-        )
-
-    if leverage <= 0:
-        leverage = 1
-
-    return (
-        abs(notional)
-        / leverage
-    )
-
-# =========================================================
-# CANCEL STOP LOSS
+# CANCEL EXISTING PROTECTIVE STOP LOSSES
 # =========================================================
 
 def cancel_existing_stop_losses(
@@ -727,17 +962,17 @@ def cancel_existing_stop_losses(
             )
 
             correct_position = (
-                position_side
-                == "BOTH"
+                position_side == "BOTH"
                 or
-                order_position_side
-                == position_side
+                order_position_side == position_side
             )
 
             is_protective = (
                 reduce_only
                 or
                 close_position_flag
+                or
+                position_side != "BOTH"
             )
 
             if (
@@ -757,6 +992,12 @@ def cancel_existing_stop_losses(
                     ],
                 )
 
+                log.info(
+                    "Cancelled old SL | %s | Order %s",
+                    symbol,
+                    order["orderId"],
+                )
+
     except Exception:
 
         log.exception(
@@ -764,24 +1005,21 @@ def cancel_existing_stop_losses(
             symbol,
         )
 
+
 # =========================================================
-# MOVE STOP TO BREAKEVEN
+# CREATE PROTECTIVE STOP
 # =========================================================
 
-def move_stop_to_breakeven(p):
+def create_protective_stop(
+    p,
+    stop_price,
+    reason,
+):
 
     symbol = p["symbol"]
 
     position_amt = float(
         p["positionAmt"]
-    )
-
-    entry_price = float(
-        p["entryPrice"]
-    )
-
-    mark_price = float(
-        p["markPrice"]
     )
 
     position_side = p.get(
@@ -792,29 +1030,18 @@ def move_stop_to_breakeven(p):
     if position_amt == 0:
         return False
 
-    if entry_price <= 0:
-        return False
-
-    if position_amt > 0:
-
-        close_side = SIDE_SELL
-
-        if mark_price <= entry_price:
-            return False
-
-    else:
-
-        close_side = SIDE_BUY
-
-        if mark_price >= entry_price:
-            return False
+    close_side = (
+        SIDE_SELL
+        if position_amt > 0
+        else SIDE_BUY
+    )
 
     tick_size = get_tick_size(
         symbol
     )
 
     stop_price = round_price_to_tick(
-        entry_price,
+        stop_price,
         tick_size,
         close_side,
     )
@@ -840,26 +1067,21 @@ def move_stop_to_breakeven(p):
 
         if position_side == "BOTH":
 
-            params[
-                "reduceOnly"
-            ] = True
+            params["reduceOnly"] = True
 
         else:
 
-            params[
-                "positionSide"
-            ] = position_side
+            params["positionSide"] = position_side
 
-        client.futures_create_order(
+        order = client.futures_create_order(
             **params
         )
 
         log.info(
-            "BREAKEVEN ARMED %s | "
-            "Entry %.8f | "
-            "Stop %.8f",
+            "%s | %s | Qty %.8f | Stop %.8f",
+            reason,
             symbol,
-            entry_price,
+            abs(position_amt),
             stop_price,
         )
 
@@ -868,11 +1090,203 @@ def move_stop_to_breakeven(p):
     except Exception:
 
         log.exception(
-            "Failed moving %s stop to breakeven",
+            "Failed creating protective stop for %s",
             symbol,
         )
 
         return False
+
+
+# =========================================================
+# INITIAL -20% ROI STOP PRICE
+# =========================================================
+
+def calculate_initial_stop_price(p):
+
+    entry_price = float(
+        p["entryPrice"]
+    )
+
+    position_amt = float(
+        p["positionAmt"]
+    )
+
+    leverage = float(
+        p.get(
+            "leverage",
+            1,
+        )
+        or 1
+    )
+
+    if entry_price <= 0:
+        return None
+
+    if leverage <= 0:
+        leverage = 1
+
+    # Example:
+    #
+    # -20% ROI at 16x leverage:
+    #
+    # 20 / 16 = approximately 1.25% adverse price move.
+    #
+    price_move_pct = (
+        INITIAL_STOP_LOSS_ROI_PCT
+        / leverage
+    )
+
+    price_move_fraction = (
+        price_move_pct
+        / 100.0
+    )
+
+    if position_amt > 0:
+
+        # LONG
+        stop_price = (
+            entry_price
+            * (
+                1.0
+                - price_move_fraction
+            )
+        )
+
+    else:
+
+        # SHORT
+        stop_price = (
+            entry_price
+            * (
+                1.0
+                + price_move_fraction
+            )
+        )
+
+    return stop_price
+
+
+# =========================================================
+# ARM INITIAL STOP LOSS
+# =========================================================
+
+def arm_initial_stop_loss(p):
+
+    stop_price = calculate_initial_stop_price(
+        p
+    )
+
+    if not stop_price:
+        return False
+
+    return create_protective_stop(
+        p,
+        stop_price,
+        (
+            f"INITIAL SL "
+            f"-{INITIAL_STOP_LOSS_ROI_PCT:.1f}% ROI"
+        ),
+    )
+
+
+# =========================================================
+# MOVE STOP TO BREAKEVEN
+# =========================================================
+
+def move_stop_to_breakeven(p):
+
+    entry_price = float(
+        p["entryPrice"]
+    )
+
+    # Prefer Binance's breakEvenPrice if available.
+    try:
+
+        break_even_price = float(
+            p.get(
+                "breakEvenPrice",
+                0,
+            )
+            or 0
+        )
+
+    except Exception:
+
+        break_even_price = 0
+
+    if break_even_price <= 0:
+
+        break_even_price = entry_price
+
+    return create_protective_stop(
+        p,
+        break_even_price,
+        "BREAKEVEN SL",
+    )
+
+
+# =========================================================
+# PARTIAL CLOSE
+# =========================================================
+
+def execute_partial_take_profit(
+    p,
+):
+
+    symbol = p["symbol"]
+
+    position_amt = float(
+        p["positionAmt"]
+    )
+
+    position_side = p.get(
+        "positionSide",
+        "BOTH",
+    )
+
+    if position_amt == 0:
+        return False
+
+    close_quantity = (
+        abs(position_amt)
+        * (
+            PARTIAL_CLOSE_PCT
+            / 100.0
+        )
+    )
+
+    order = close_position_quantity(
+        symbol=symbol,
+        current_position_amt=position_amt,
+        quantity=close_quantity,
+        reason=(
+            f"PARTIAL TP "
+            f"{PARTIAL_CLOSE_PCT:.1f}% "
+            f"at +{PARTIAL_TP_ROI_PCT:.1f}% ROI"
+        ),
+        position_side=position_side,
+    )
+
+    if not order:
+        return False
+
+    # Give Binance a moment to update the remaining quantity.
+    time.sleep(0.75)
+
+    remaining_position = get_current_position(
+        symbol,
+        position_side,
+    )
+
+    if remaining_position:
+
+        # Recreate breakeven stop using the NEW smaller quantity.
+        move_stop_to_breakeven(
+            remaining_position
+        )
+
+    return True
+
 
 # =========================================================
 # CHECK POSITIONS
@@ -908,19 +1322,24 @@ def check_positions():
         for p in open_positions
     }
 
+    # Remove state when position is completely closed.
     for key in list(
-        breakeven_armed.keys()
+        position_states.keys()
     ):
 
         if key not in active_keys:
 
-            breakeven_armed.pop(
+            position_states.pop(
                 key,
                 None,
             )
 
     total_unrealized = 0.0
     snapshot = []
+
+    # =====================================================
+    # INDIVIDUAL POSITION MANAGEMENT
+    # =====================================================
 
     for p in open_positions:
 
@@ -930,30 +1349,180 @@ def check_positions():
             p["positionAmt"]
         )
 
+        position_side = p.get(
+            "positionSide",
+            "BOTH",
+        )
+
+        entry_price = float(
+            p["entryPrice"]
+        )
+
+        mark_price = float(
+            p["markPrice"]
+        )
+
+        leverage = float(
+            p.get(
+                "leverage",
+                1,
+            )
+            or 1
+        )
+
         unrealized = float(
             p["unRealizedProfit"]
         )
 
         total_unrealized += unrealized
 
-        margin = position_margin(p)
+        roi_pct = calculate_roi_pct(
+            p
+        )
 
-        roi_pct = (
-            unrealized
-            / margin
-            * 100.0
-        ) if margin > 0 else 0.0
+        key = position_key(
+            p
+        )
 
-        key = position_key(p)
+        # -----------------------------------------------
+        # CREATE STATE FOR NEW POSITION
+        # -----------------------------------------------
+
+        if key not in position_states:
+
+            position_states[key] = {
+                "entry_price": entry_price,
+                "initial_stop_armed": False,
+                "breakeven_armed": False,
+                "partial_tp_done": False,
+            }
+
+        state = position_states[
+            key
+        ]
+
+        # -----------------------------------------------
+        # DETECT A NEW TRADE ON SAME SYMBOL
+        # -----------------------------------------------
+
+        old_entry_price = float(
+            state.get(
+                "entry_price",
+                0,
+            )
+        )
+
+        if (
+            old_entry_price > 0
+            and
+            abs(
+                entry_price
+                - old_entry_price
+            )
+            > 0.00000001
+        ):
+
+            log.info(
+                "New position detected | %s | Entry changed %.8f -> %.8f",
+                symbol,
+                old_entry_price,
+                entry_price,
+            )
+
+            state = {
+                "entry_price": entry_price,
+                "initial_stop_armed": False,
+                "breakeven_armed": False,
+                "partial_tp_done": False,
+            }
+
+            position_states[
+                key
+            ] = state
+
+        # -----------------------------------------------
+        # 1. INITIAL STOP LOSS
+        # -----------------------------------------------
+
+        if (
+            not state[
+                "initial_stop_armed"
+            ]
+            and
+            not state[
+                "breakeven_armed"
+            ]
+        ):
+
+            success = arm_initial_stop_loss(
+                p
+            )
+
+            if success:
+
+                state[
+                    "initial_stop_armed"
+                ] = True
+
+        # -----------------------------------------------
+        # BACKUP HARD -20% ROI EXIT
+        #
+        # The exchange STOP_MARKET should normally fire
+        # first. This is a second protection layer.
+        # -----------------------------------------------
+
+        if (
+            roi_pct
+            <= -INITIAL_STOP_LOSS_ROI_PCT
+        ):
+
+            close_position(
+                symbol,
+                position_amt,
+                (
+                    f"HARD SL "
+                    f"{roi_pct:.2f}% ROI"
+                ),
+                position_side,
+            )
+
+            continue
+
+        # -----------------------------------------------
+        # 2. FINAL TP +60%
+        #
+        # Check BEFORE partial TP so if ROI jumps directly
+        # above +60%, the bot closes everything.
+        # -----------------------------------------------
+
+        if (
+            roi_pct
+            >= FINAL_TP_ROI_PCT
+        ):
+
+            close_position(
+                symbol,
+                position_amt,
+                (
+                    f"FINAL TP "
+                    f"+{roi_pct:.2f}% ROI"
+                ),
+                position_side,
+            )
+
+            continue
+
+        # -----------------------------------------------
+        # 3. BREAKEVEN AT +10%
+        # -----------------------------------------------
 
         if (
             roi_pct
             >= BREAKEVEN_TRIGGER_ROI_PCT
             and
-            not breakeven_armed.get(
-                key,
-                False,
-            )
+            not state[
+                "breakeven_armed"
+            ]
         ):
 
             success = move_stop_to_breakeven(
@@ -962,52 +1531,106 @@ def check_positions():
 
             if success:
 
-                breakeven_armed[
-                    key
+                state[
+                    "breakeven_armed"
                 ] = True
 
-        snapshot.append({
-            "symbol": symbol,
-            "positionAmt": position_amt,
-            "entryPrice": float(
-                p["entryPrice"]
-            ),
-            "markPrice": float(
-                p["markPrice"]
-            ),
-            "unrealizedProfit": round(
-                unrealized,
-                4,
-            ),
-            "roiPct": round(
-                roi_pct,
-                2,
-            ),
-            "breakevenArmed": (
-                breakeven_armed.get(
-                    key,
-                    False,
+                log.info(
+                    "BREAKEVEN ACTIVATED | %s | ROI %.2f%%",
+                    symbol,
+                    roi_pct,
                 )
-            ),
-        })
+
+        # -----------------------------------------------
+        # 4. CLOSE 50% AT +20%
+        # -----------------------------------------------
 
         if (
             roi_pct
-            >= PER_POSITION_PROFIT_PCT
+            >= PARTIAL_TP_ROI_PCT
+            and
+            not state[
+                "partial_tp_done"
+            ]
         ):
 
-            close_position(
-                symbol,
-                position_amt,
-                (
-                    f"+{roi_pct:.2f}% "
-                    f"margin ROI"
-                ),
-                p.get(
-                    "positionSide",
-                    "BOTH",
-                ),
+            success = execute_partial_take_profit(
+                p
             )
+
+            if success:
+
+                state[
+                    "partial_tp_done"
+                ] = True
+
+                state[
+                    "breakeven_armed"
+                ] = True
+
+                log.info(
+                    "PARTIAL TP COMPLETE | %s | "
+                    "%.1f%% of position closed",
+                    symbol,
+                    PARTIAL_CLOSE_PCT,
+                )
+
+        # -----------------------------------------------
+        # SNAPSHOT
+        # -----------------------------------------------
+
+        snapshot.append({
+
+            "symbol":
+                symbol,
+
+            "positionSide":
+                position_side,
+
+            "positionAmt":
+                position_amt,
+
+            "entryPrice":
+                entry_price,
+
+            "markPrice":
+                mark_price,
+
+            "leverage":
+                leverage,
+
+            "unrealizedProfit":
+                round(
+                    unrealized,
+                    4,
+                ),
+
+            "roiPct":
+                round(
+                    roi_pct,
+                    2,
+                ),
+
+            "initialStopArmed":
+                state[
+                    "initial_stop_armed"
+                ],
+
+            "breakevenArmed":
+                state[
+                    "breakeven_armed"
+                ],
+
+            "partialTpDone":
+                state[
+                    "partial_tp_done"
+                ],
+
+        })
+
+    # =====================================================
+    # SNAPSHOT UPDATE
+    # =====================================================
 
     latest_snapshot[
         "positions"
@@ -1024,12 +1647,25 @@ def check_positions():
         "last_run"
     ] = time.time()
 
+    # =====================================================
+    # PORTFOLIO PROFIT EXIT
+    #
+    # 0 = DISABLED
+    # =====================================================
+
     if (
+        PORTFOLIO_PROFIT_USD > 0
+        and
         total_unrealized
         >= PORTFOLIO_PROFIT_USD
         and
         open_positions
     ):
+
+        log.info(
+            "PORTFOLIO TP HIT | Total +$%.2f",
+            total_unrealized,
+        )
 
         for p in open_positions:
 
@@ -1043,7 +1679,7 @@ def check_positions():
                     p["symbol"],
                     position_amt,
                     (
-                        f"portfolio "
+                        f"PORTFOLIO TP "
                         f"+${total_unrealized:.2f}"
                     ),
                     p.get(
@@ -1052,6 +1688,7 @@ def check_positions():
                     ),
                 )
 
+
 # =========================================================
 # MONITOR LOOP
 # =========================================================
@@ -1059,13 +1696,18 @@ def check_positions():
 def monitor_loop():
 
     log.info(
-        "Starting monitor | "
-        "Breakeven %.1f%% ROI | "
-        "Position TP %.1f%% ROI | "
+        "STARTING MONITOR | "
+        "Initial SL -%.1f%% ROI | "
+        "BE +%.1f%% ROI | "
+        "Partial TP +%.1f%% ROI / %.1f%% position | "
+        "Final TP +%.1f%% ROI | "
         "Portfolio TP $%.2f | "
-        "Poll every %ss",
+        "Poll %ss",
+        INITIAL_STOP_LOSS_ROI_PCT,
         BREAKEVEN_TRIGGER_ROI_PCT,
-        PER_POSITION_PROFIT_PCT,
+        PARTIAL_TP_ROI_PCT,
+        PARTIAL_CLOSE_PCT,
+        FINAL_TP_ROI_PCT,
         PORTFOLIO_PROFIT_USD,
         POLL_INTERVAL_SECONDS,
     )
@@ -1073,9 +1715,11 @@ def monitor_loop():
     while True:
 
         try:
+
             check_positions()
 
         except Exception:
+
             log.exception(
                 "Unexpected monitor-loop error"
             )
@@ -1083,6 +1727,7 @@ def monitor_loop():
         time.sleep(
             POLL_INTERVAL_SECONDS
         )
+
 
 # =========================================================
 # HEALTH
@@ -1095,9 +1740,13 @@ def monitor_loop():
 def health():
 
     return jsonify({
-        "status": "ok",
+
+        "status":
+            "ok",
+
         "service":
             "binance-profit-monitor",
+
         "wundertrading_configured":
             bool(
                 WUNDER_API_KEY
@@ -1106,7 +1755,9 @@ def health():
                 and
                 WUNDER_PROFILE_CODE
             ),
+
     }), 200
+
 
 # =========================================================
 # STATUS
@@ -1122,11 +1773,20 @@ def status():
 
         "config": {
 
+            "initial_stop_loss_roi_pct":
+                INITIAL_STOP_LOSS_ROI_PCT,
+
             "breakeven_trigger_roi_pct":
                 BREAKEVEN_TRIGGER_ROI_PCT,
 
-            "per_position_profit_pct":
-                PER_POSITION_PROFIT_PCT,
+            "partial_tp_roi_pct":
+                PARTIAL_TP_ROI_PCT,
+
+            "partial_close_pct":
+                PARTIAL_CLOSE_PCT,
+
+            "final_tp_roi_pct":
+                FINAL_TP_ROI_PCT,
 
             "portfolio_profit_usd":
                 PORTFOLIO_PROFIT_USD,
@@ -1147,10 +1807,14 @@ def status():
         "snapshot":
             latest_snapshot,
 
+        "position_states":
+            position_states,
+
         "wundertrading":
             wunder_status,
 
     }), 200
+
 
 # =========================================================
 # WUNDER TEST
@@ -1176,6 +1840,7 @@ def wunder_test():
         result
     ), 500
 
+
 # =========================================================
 # WUNDER PROFILES
 # =========================================================
@@ -1195,9 +1860,15 @@ def wunder_profiles():
     except Exception as e:
 
         return jsonify({
-            "success": False,
-            "message": str(e),
+
+            "success":
+                False,
+
+            "message":
+                str(e),
+
         }), 500
+
 
 # =========================================================
 # CREATE ONE TRADE
@@ -1230,9 +1901,15 @@ def trade_pair(
         )
 
         return jsonify({
-            "success": False,
-            "message": str(e),
+
+            "success":
+                False,
+
+            "message":
+                str(e),
+
         }), 500
+
 
 # =========================================================
 # START MONITOR
@@ -1244,6 +1921,7 @@ _thread = threading.Thread(
 )
 
 _thread.start()
+
 
 # =========================================================
 # START FLASK
