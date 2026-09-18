@@ -10,7 +10,7 @@ import urllib.request
 import urllib.error
 from decimal import Decimal, ROUND_DOWN
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 
@@ -95,6 +95,20 @@ PORTFOLIO_PROFIT_USD = env_float(
     0
 )
 
+# ------------------------------------------------------------
+# NEW TRADINGVIEW ENTRY SETTINGS
+# ------------------------------------------------------------
+
+ORDER_MARGIN_USDT = env_float(
+    "ORDER_MARGIN_USDT",
+    50
+)
+
+ENTRY_LEVERAGE = env_int(
+    "ENTRY_LEVERAGE",
+    16
+)
+
 
 # ============================================================
 # BINANCE CLIENT
@@ -129,6 +143,8 @@ last_errors = {}
 
 BOT_ALGO_PREFIX = "MAQSL"
 
+entry_lock = threading.Lock()
+
 
 # ============================================================
 # SIGNED BINANCE ALGO REQUEST
@@ -162,6 +178,7 @@ def binance_algo_request(method, path, params=None):
     method = method.upper()
 
     if method == "POST":
+
         url = BINANCE_FUTURES_BASE + path
 
         req = urllib.request.Request(
@@ -172,6 +189,7 @@ def binance_algo_request(method, path, params=None):
         )
 
     else:
+
         url = BINANCE_FUTURES_BASE + path + "?" + signed_query
 
         req = urllib.request.Request(
@@ -315,6 +333,20 @@ def get_current_position(
     return None
 
 
+def get_any_symbol_position(symbol):
+
+    positions = client.futures_position_information(
+        symbol=symbol
+    )
+
+    for p in positions:
+
+        if abs(float(p["positionAmt"])) > 0:
+            return p
+
+    return None
+
+
 # ============================================================
 # EXCHANGE FILTERS
 # ============================================================
@@ -324,6 +356,7 @@ def get_symbol_info(symbol):
     exchange_info = client.futures_exchange_info()
 
     for item in exchange_info["symbols"]:
+
         if item["symbol"] == symbol:
             return item
 
@@ -447,9 +480,7 @@ def close_position_quantity(
         params["reduceOnly"] = True
 
     else:
-        params[
-            "positionSide"
-        ] = position_side
+        params["positionSide"] = position_side
 
     try:
 
@@ -849,7 +880,374 @@ def get_or_create_state(p):
 
 
 # ============================================================
-# MAIN MONITOR
+# NEW - TRADINGVIEW SYMBOL NORMALIZATION
+# ============================================================
+
+def normalize_symbol(raw_symbol):
+
+    symbol = str(raw_symbol).upper().strip()
+
+    # Handles values such as BINANCE:BTCUSDT
+    if ":" in symbol:
+        symbol = symbol.split(":")[-1]
+
+    # Remove common TradingView perpetual suffix
+    if symbol.endswith(".P"):
+        symbol = symbol[:-2]
+
+    # Remove separators if supplied
+    symbol = symbol.replace("/", "")
+    symbol = symbol.replace("-", "")
+    symbol = symbol.replace("_", "")
+
+    return symbol
+
+
+# ============================================================
+# NEW - GET FUTURES PRICE
+# ============================================================
+
+def get_futures_price(symbol):
+
+    ticker = client.futures_symbol_ticker(
+        symbol=symbol
+    )
+
+    return float(
+        ticker["price"]
+    )
+
+
+# ============================================================
+# NEW - VALIDATE SYMBOL
+# ============================================================
+
+def validate_futures_symbol(symbol):
+
+    info = get_symbol_info(symbol)
+
+    if info is None:
+        raise ValueError(
+            f"{symbol} is not a Binance Futures symbol"
+        )
+
+    status = str(
+        info.get("status", "")
+    ).upper()
+
+    if status and status != "TRADING":
+        raise ValueError(
+            f"{symbol} is not currently trading"
+        )
+
+    return info
+
+
+# ============================================================
+# NEW - SET LEVERAGE
+# ============================================================
+
+def set_symbol_leverage(symbol):
+
+    result = client.futures_change_leverage(
+        symbol=symbol,
+        leverage=ENTRY_LEVERAGE
+    )
+
+    log.info(
+        "%s leverage set to %sx",
+        symbol,
+        ENTRY_LEVERAGE
+    )
+
+    return result
+
+
+# ============================================================
+# NEW - CALCULATE ENTRY QUANTITY
+#
+# ORDER_MARGIN_USDT = margin capital
+# ENTRY_LEVERAGE = leverage
+#
+# Example:
+# $50 margin x 16 leverage = $800 notional
+# ============================================================
+
+def calculate_entry_quantity(symbol):
+
+    price = get_futures_price(symbol)
+
+    if price <= 0:
+        raise ValueError(
+            f"Invalid market price for {symbol}"
+        )
+
+    notional = (
+        ORDER_MARGIN_USDT
+        * ENTRY_LEVERAGE
+    )
+
+    raw_quantity = (
+        notional / price
+    )
+
+    quantity = round_quantity_down(
+        symbol,
+        raw_quantity
+    )
+
+    if quantity <= 0:
+        raise ValueError(
+            f"Calculated quantity for {symbol} is zero"
+        )
+
+    return quantity, price, notional
+
+
+# ============================================================
+# NEW - OPEN MARKET POSITION
+# ============================================================
+
+def open_market_position(
+    symbol,
+    signal
+):
+
+    quantity, price, notional = (
+        calculate_entry_quantity(symbol)
+    )
+
+    side = (
+        SIDE_BUY
+        if signal == "BUY"
+        else SIDE_SELL
+    )
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": ORDER_TYPE_MARKET,
+        "quantity": quantity
+    }
+
+    result = client.futures_create_order(
+        **params
+    )
+
+    log.warning(
+        "ENTRY %s %s qty=%s "
+        "price≈%s margin=%s leverage=%sx "
+        "notional≈%s",
+        signal,
+        symbol,
+        quantity,
+        price,
+        ORDER_MARGIN_USDT,
+        ENTRY_LEVERAGE,
+        notional
+    )
+
+    return result
+
+
+# ============================================================
+# NEW - WAIT UNTIL POSITION CLOSED
+# ============================================================
+
+def wait_until_position_closed(
+    symbol,
+    timeout_seconds=10
+):
+
+    started = time.time()
+
+    while (
+        time.time() - started
+        < timeout_seconds
+    ):
+
+        p = get_any_symbol_position(
+            symbol
+        )
+
+        if p is None:
+            return True
+
+        time.sleep(0.25)
+
+    return False
+
+
+# ============================================================
+# NEW - PROCESS TRADINGVIEW SIGNAL
+#
+# BUY:
+#   No position -> LONG
+#   Existing LONG -> IGNORE
+#   Existing SHORT -> CLOSE + LONG
+#
+# SELL:
+#   No position -> SHORT
+#   Existing SHORT -> IGNORE
+#   Existing LONG -> CLOSE + SHORT
+# ============================================================
+
+def process_entry_signal(
+    signal,
+    raw_symbol
+):
+
+    signal = str(signal).upper().strip()
+    symbol = normalize_symbol(raw_symbol)
+
+    if signal not in (
+        "BUY",
+        "SELL"
+    ):
+        raise ValueError(
+            "Signal must be BUY or SELL"
+        )
+
+    validate_futures_symbol(
+        symbol
+    )
+
+    with entry_lock:
+
+        current = get_any_symbol_position(
+            symbol
+        )
+
+        # ----------------------------------------------------
+        # EXISTING POSITION
+        # ----------------------------------------------------
+
+        if current:
+
+            amount = float(
+                current["positionAmt"]
+            )
+
+            current_direction = (
+                "BUY"
+                if amount > 0
+                else "SELL"
+            )
+
+            # SAME DIRECTION = IGNORE
+            if current_direction == signal:
+
+                log.info(
+                    "%s %s ignored - already in same direction",
+                    signal,
+                    symbol
+                )
+
+                return {
+                    "status": "ignored",
+                    "reason": "same_direction_position_exists",
+                    "signal": signal,
+                    "symbol": symbol
+                }
+
+            # OPPOSITE DIRECTION
+            log.warning(
+                "%s opposite signal received for %s. "
+                "Closing current %s position.",
+                signal,
+                symbol,
+                current_direction
+            )
+
+            cancel_bot_stops(
+                symbol,
+                current.get(
+                    "positionSide",
+                    "BOTH"
+                )
+            )
+
+            close_result = close_position(
+                current
+            )
+
+            if not close_result:
+
+                raise RuntimeError(
+                    f"Could not close existing {symbol} position"
+                )
+
+            closed = wait_until_position_closed(
+                symbol
+            )
+
+            if not closed:
+
+                raise RuntimeError(
+                    f"{symbol} position did not close in time"
+                )
+
+            position_states.pop(
+                position_key(current),
+                None
+            )
+
+        # ----------------------------------------------------
+        # SET LEVERAGE
+        # ----------------------------------------------------
+
+        set_symbol_leverage(
+            symbol
+        )
+
+        # ----------------------------------------------------
+        # OPEN NEW POSITION
+        # ----------------------------------------------------
+
+        order = open_market_position(
+            symbol,
+            signal
+        )
+
+        # Give Binance a moment to publish position
+        time.sleep(0.5)
+
+        new_position = get_any_symbol_position(
+            symbol
+        )
+
+        # Immediately arm initial SL where possible
+        if new_position:
+
+            state = get_or_create_state(
+                new_position
+            )
+
+            if arm_initial_stop_loss(
+                new_position
+            ):
+
+                state[
+                    "initial_stop_armed"
+                ] = True
+
+        return {
+            "status": "executed",
+            "signal": signal,
+            "symbol": symbol,
+            "margin_usdt": ORDER_MARGIN_USDT,
+            "leverage": ENTRY_LEVERAGE,
+            "approx_notional_usdt":
+                ORDER_MARGIN_USDT
+                * ENTRY_LEVERAGE,
+            "orderId": order.get(
+                "orderId"
+            )
+        }
+
+
+# ============================================================
+# MAIN RISK MONITOR
 # ============================================================
 
 def check_positions():
@@ -915,7 +1313,6 @@ def check_positions():
 
         # ====================================================
         # HARD SOFTWARE STOP
-        # ROI <= -20% → MARKET CLOSE IMMEDIATELY
         # ====================================================
 
         if roi <= -INITIAL_STOP_LOSS_ROI_PCT:
@@ -943,7 +1340,6 @@ def check_positions():
 
         # ====================================================
         # FINAL TP
-        # ROI >= +60% → CLOSE ALL REMAINING
         # ====================================================
 
         if roi >= FINAL_TP_ROI_PCT:
@@ -970,7 +1366,6 @@ def check_positions():
 
         # ====================================================
         # BREAKEVEN
-        # ROI >= +10%
         # ====================================================
 
         if (
@@ -1019,7 +1414,6 @@ def check_positions():
 
         # ====================================================
         # PARTIAL TAKE PROFIT
-        # ROI >= +20% → CLOSE 50%
         # ====================================================
 
         if (
@@ -1129,7 +1523,6 @@ def check_positions():
 
     # ========================================================
     # OPTIONAL PORTFOLIO EXIT
-    # 0 = DISABLED
     # ========================================================
 
     if (
@@ -1176,17 +1569,23 @@ def check_positions():
 
 
 # ============================================================
-# LOOP
+# MONITOR LOOP
 # ============================================================
 
 def monitor_loop():
 
     log.info(
-        "BINANCE-ONLY manager started"
+        "BINANCE manager started"
     )
 
     log.info(
-        "ALL open Futures positions will be monitored"
+        "TradingView entries ENABLED"
+    )
+
+    log.info(
+        "Entry margin $%.2f | leverage %sx",
+        ORDER_MARGIN_USDT,
+        ENTRY_LEVERAGE
     )
 
     log.info(
@@ -1228,7 +1627,7 @@ def health():
         {
             "status": "ok",
             "service": "binance-risk-manager",
-            "mode": "BINANCE_ONLY"
+            "mode": "TRADINGVIEW_BINANCE"
         }
     )
 
@@ -1239,9 +1638,21 @@ def status():
     return jsonify(
         {
             "mode":
-                "BINANCE_ONLY",
+                "TRADINGVIEW_BINANCE",
 
-            "config": {
+            "entry_config": {
+                "order_margin_usdt":
+                    ORDER_MARGIN_USDT,
+
+                "entry_leverage":
+                    ENTRY_LEVERAGE,
+
+                "approx_notional_usdt":
+                    ORDER_MARGIN_USDT
+                    * ENTRY_LEVERAGE
+            },
+
+            "risk_config": {
                 "poll_interval_seconds":
                     POLL_INTERVAL_SECONDS,
 
@@ -1282,6 +1693,109 @@ def status():
                 last_errors
         }
     )
+
+
+# ============================================================
+# NEW - TRADINGVIEW WEBHOOK
+#
+# ACCEPTED:
+#
+# BUY|BTCUSDT
+# SELL|BTCUSDT
+#
+# Also accepts JSON:
+#
+# {"signal":"BUY","symbol":"BTCUSDT"}
+# ============================================================
+
+@app.route(
+    "/webhook",
+    methods=["POST"]
+)
+def tradingview_webhook():
+
+    try:
+
+        signal = None
+        symbol = None
+
+        # ----------------------------------------------------
+        # JSON MESSAGE
+        # ----------------------------------------------------
+
+        if request.is_json:
+
+            data = request.get_json(
+                silent=True
+            ) or {}
+
+            signal = data.get(
+                "signal"
+            )
+
+            symbol = data.get(
+                "symbol"
+            )
+
+        # ----------------------------------------------------
+        # TEXT MESSAGE
+        # BUY|BTCUSDT
+        # ----------------------------------------------------
+
+        if not signal or not symbol:
+
+            raw = request.get_data(
+                as_text=True
+            ).strip()
+
+            if "|" in raw:
+
+                parts = raw.split(
+                    "|",
+                    1
+                )
+
+                signal = parts[0]
+                symbol = parts[1]
+
+        if not signal or not symbol:
+
+            return jsonify(
+                {
+                    "status": "error",
+                    "error":
+                        "Expected BUY|BTCUSDT "
+                        "or SELL|BTCUSDT"
+                }
+            ), 400
+
+        log.warning(
+            "TradingView webhook received: %s | %s",
+            signal,
+            symbol
+        )
+
+        result = process_entry_signal(
+            signal,
+            symbol
+        )
+
+        return jsonify(
+            result
+        ), 200
+
+    except Exception as exc:
+
+        log.exception(
+            "TradingView webhook failed"
+        )
+
+        return jsonify(
+            {
+                "status": "error",
+                "error": str(exc)
+            }
+        ), 500
 
 
 # ============================================================
