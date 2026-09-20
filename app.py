@@ -779,26 +779,24 @@ def arm_initial_stop_loss(p):
 # ============================================================
 
 def get_breakeven_price(p):
+    """
+    MAQ breakeven definition:
+    Protect the remaining position at its Binance position entry price.
 
-    try:
+    IMPORTANT:
+    Do NOT use Binance's `breakEvenPrice` field here. That field can reflect
+    realized PnL / fees and can move materially away from the current position
+    entry after a partial take-profit. For this strategy, "breakeven" means
+    the current position's entryPrice.
+    """
+    entry_price = float(p.get("entryPrice", 0) or 0)
 
-        be = float(
-            p.get(
-                "breakEvenPrice",
-                0
-            )
-            or 0
+    if entry_price <= 0:
+        raise ValueError(
+            f"Invalid entryPrice for {p.get('symbol', 'UNKNOWN')}"
         )
 
-        if be > 0:
-            return be
-
-    except Exception:
-        pass
-
-    return float(
-        p["entryPrice"]
-    )
+    return entry_price
 
 
 def move_stop_to_breakeven(p):
