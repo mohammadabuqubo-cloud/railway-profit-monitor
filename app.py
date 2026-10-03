@@ -8,6 +8,7 @@ import json
 import urllib.parse
 import urllib.request
 import urllib.error
+
 from decimal import Decimal, ROUND_DOWN
 
 from flask import Flask, jsonify, request
@@ -16,11 +17,20 @@ from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 
 
 # ============================================================
-# LOGGING / FLASK
+# LOGGING
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("binance-risk-manager")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+log = logging.getLogger("MAQ-BINANCE-MANAGER")
+
+
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
 
@@ -70,14 +80,25 @@ USE_TESTNET = (
     ).lower() == "true"
 )
 
-# Never poll Binance faster than every 30 seconds.
-POLL_INTERVAL_SECONDS = max(
-    30,
-    env_int(
-        "POLL_INTERVAL_SECONDS",
-        30
-    )
+
+# ------------------------------------------------------------
+# ENTRY
+# ------------------------------------------------------------
+
+ORDER_MARGIN_USDT = env_float(
+    "ORDER_MARGIN_USDT",
+    50
 )
+
+ENTRY_LEVERAGE = env_int(
+    "ENTRY_LEVERAGE",
+    16
+)
+
+
+# ------------------------------------------------------------
+# RISK MANAGEMENT
+# ------------------------------------------------------------
 
 INITIAL_STOP_LOSS_ROI_PCT = env_float(
     "INITIAL_STOP_LOSS_ROI_PCT",
@@ -109,15 +130,35 @@ PORTFOLIO_PROFIT_USD = env_float(
     0
 )
 
-ORDER_MARGIN_USDT = env_float(
-    "ORDER_MARGIN_USDT",
-    50
+
+# ------------------------------------------------------------
+# MONITORING
+# ------------------------------------------------------------
+
+POLL_INTERVAL_SECONDS = max(
+    30,
+    env_int(
+        "POLL_INTERVAL_SECONDS",
+        30
+    )
 )
 
-ENTRY_LEVERAGE = env_int(
-    "ENTRY_LEVERAGE",
-    16
+
+# Newly opened positions will not be SOFTWARE-CLOSED during
+# this short grace period.
+#
+# IMPORTANT:
+# Binance protective stop is still armed immediately.
+# ------------------------------------------------------------
+
+ENTRY_GRACE_SECONDS = max(
+    5,
+    env_int(
+        "ENTRY_GRACE_SECONDS",
+        10
+    )
 )
+
 
 EXCHANGE_INFO_CACHE_SECONDS = max(
     3600,
@@ -138,11 +179,13 @@ if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         "BINANCE_API_KEY or BINANCE_API_SECRET is missing"
     )
 
+
 client = Client(
     BINANCE_API_KEY,
     BINANCE_API_SECRET,
     testnet=USE_TESTNET
 )
+
 
 BINANCE_FUTURES_BASE = (
     "https://testnet.binancefuture.com"
@@ -165,6 +208,7 @@ last_snapshot = {
     "total_unrealized_profit": 0.0
 }
 
+
 BOT_ALGO_PREFIX = "MAQSL"
 
 entry_lock = threading.Lock()
@@ -175,6 +219,7 @@ exchange_info_lock = threading.Lock()
 
 monitor_started = False
 
+
 exchange_info_cache = {
     "loaded_at": 0.0,
     "symbols": {}
@@ -182,7 +227,7 @@ exchange_info_cache = {
 
 
 # ============================================================
-# RATE-LIMIT HELPERS
+# RATE LIMIT HELPER
 # ============================================================
 
 def is_binance_rate_limit_error(exc):
@@ -217,25 +262,25 @@ def binance_algo_request(
 
     params["recvWindow"] = 5000
 
+
     query = urllib.parse.urlencode(
         params
     )
 
+
     signature = hmac.new(
-        BINANCE_API_SECRET.encode(
-            "utf-8"
-        ),
-        query.encode(
-            "utf-8"
-        ),
+        BINANCE_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
+
 
     signed_query = (
         query
         + "&signature="
         + signature
     )
+
 
     headers = {
         "X-MBX-APIKEY":
@@ -245,7 +290,9 @@ def binance_algo_request(
             "application/x-www-form-urlencoded"
     }
 
+
     method = method.upper()
+
 
     if method == "POST":
 
@@ -256,12 +303,11 @@ def binance_algo_request(
 
         req = urllib.request.Request(
             url,
-            data=signed_query.encode(
-                "utf-8"
-            ),
+            data=signed_query.encode("utf-8"),
             headers=headers,
             method="POST"
         )
+
 
     else:
 
@@ -277,6 +323,7 @@ def binance_algo_request(
             headers=headers,
             method=method
         )
+
 
     try:
 
@@ -296,6 +343,7 @@ def binance_algo_request(
                 text
             )
 
+
     except urllib.error.HTTPError as exc:
 
         body = exc.read().decode(
@@ -307,6 +355,7 @@ def binance_algo_request(
             f"Binance Algo HTTP "
             f"{exc.code}: {body}"
         ) from exc
+
 
     except Exception as exc:
 
@@ -377,6 +426,7 @@ def get_current_position(
                 )
             ) > 0
         ):
+
             return p
 
     return None
@@ -395,10 +445,15 @@ def get_any_symbol_position(symbol):
                 p["positionAmt"]
             )
         ) > 0:
+
             return p
 
     return None
 
+
+# ============================================================
+# POSITION MARGIN
+# ============================================================
 
 def position_margin(p):
 
@@ -417,6 +472,7 @@ def position_margin(p):
     except Exception:
         pass
 
+
     try:
 
         isolated = float(
@@ -431,6 +487,7 @@ def position_margin(p):
 
     except Exception:
         pass
+
 
     try:
 
@@ -460,8 +517,13 @@ def position_margin(p):
     except Exception:
         pass
 
+
     return 0.0
 
+
+# ============================================================
+# ROI
+# ============================================================
 
 def calculate_roi_pct(p):
 
@@ -471,6 +533,7 @@ def calculate_roi_pct(p):
 
     if margin <= 0:
         return 0.0
+
 
     unrealized = float(
         p.get(
@@ -484,6 +547,7 @@ def calculate_roi_pct(p):
         or 0
     )
 
+
     return (
         unrealized
         / margin
@@ -491,7 +555,7 @@ def calculate_roi_pct(p):
 
 
 # ============================================================
-# CACHED EXCHANGE INFORMATION
+# EXCHANGE INFORMATION
 # ============================================================
 
 def refresh_exchange_info_cache(
@@ -507,6 +571,7 @@ def refresh_exchange_info_cache(
         ]
     )
 
+
     if (
         not force
         and exchange_info_cache[
@@ -515,7 +580,9 @@ def refresh_exchange_info_cache(
         and age
         < EXCHANGE_INFO_CACHE_SECONDS
     ):
+
         return
+
 
     with exchange_info_lock:
 
@@ -528,6 +595,7 @@ def refresh_exchange_info_cache(
             ]
         )
 
+
         if (
             not force
             and exchange_info_cache[
@@ -536,29 +604,36 @@ def refresh_exchange_info_cache(
             and age
             < EXCHANGE_INFO_CACHE_SECONDS
         ):
+
             return
+
 
         exchange_info = (
             client.futures_exchange_info()
         )
 
+
         exchange_info_cache[
             "symbols"
         ] = {
-            item["symbol"]: item
+
+            item["symbol"]:
+                item
+
             for item in exchange_info.get(
                 "symbols",
                 []
             )
         }
 
+
         exchange_info_cache[
             "loaded_at"
         ] = now
 
+
         log.info(
-            "Exchange information cached: "
-            "%s symbols",
+            "Exchange info cached: %s symbols",
             len(
                 exchange_info_cache[
                     "symbols"
@@ -577,6 +652,10 @@ def get_symbol_info(symbol):
         symbol
     )
 
+
+# ============================================================
+# QUANTITY / PRICE PRECISION
+# ============================================================
 
 def get_quantity_step_size(symbol):
 
@@ -657,12 +736,14 @@ def round_quantity_down(
         )
     )
 
+
     rounded = (
         value
         / step
     ).to_integral_value(
         rounding=ROUND_DOWN
     ) * step
+
 
     return float(
         rounded
@@ -682,12 +763,14 @@ def round_price(
         str(price)
     )
 
+
     rounded = (
         value
         / tick
     ).to_integral_value(
         rounding=ROUND_DOWN
     ) * tick
+
 
     return format(
         rounded,
@@ -696,12 +779,13 @@ def round_price(
 
 
 # ============================================================
-# MARKET CLOSE
+# CLOSE POSITION
 # ============================================================
 
 def close_position_quantity(
     p,
-    quantity
+    quantity,
+    reason="UNSPECIFIED"
 ):
 
     symbol = p[
@@ -712,16 +796,20 @@ def close_position_quantity(
         p["positionAmt"]
     )
 
+
     if position_amt == 0:
         return False
+
 
     quantity = round_quantity_down(
         symbol,
         quantity
     )
 
+
     if quantity <= 0:
         return False
+
 
     close_side = (
         SIDE_SELL
@@ -729,10 +817,12 @@ def close_position_quantity(
         else SIDE_BUY
     )
 
+
     position_side = p.get(
         "positionSide",
         "BOTH"
     )
+
 
     params = {
         "symbol":
@@ -748,6 +838,7 @@ def close_position_quantity(
             quantity
     }
 
+
     if position_side == "BOTH":
 
         params[
@@ -760,7 +851,17 @@ def close_position_quantity(
             "positionSide"
         ] = position_side
 
+
     try:
+
+        log.warning(
+            "CLOSE REASON=%s | %s | qty=%s | side=%s",
+            reason,
+            symbol,
+            quantity,
+            close_side
+        )
+
 
         result = (
             client.futures_create_order(
@@ -768,13 +869,16 @@ def close_position_quantity(
             )
         )
 
-        log.info(
-            "Market close %s qty=%s",
+
+        log.warning(
+            "POSITION CLOSED | %s | reason=%s",
             symbol,
-            quantity
+            reason
         )
 
+
         return result
+
 
     except Exception as exc:
 
@@ -782,15 +886,21 @@ def close_position_quantity(
             position_key(p)
         ] = str(exc)
 
+
         log.exception(
-            "Failed market close %s",
-            symbol
+            "FAILED CLOSE | %s | reason=%s",
+            symbol,
+            reason
         )
+
 
         return False
 
 
-def close_position(p):
+def close_position(
+    p,
+    reason="UNSPECIFIED"
+):
 
     return close_position_quantity(
         p,
@@ -798,7 +908,8 @@ def close_position(p):
             float(
                 p["positionAmt"]
             )
-        )
+        ),
+        reason=reason
     )
 
 
@@ -820,11 +931,14 @@ def get_open_algo_orders(symbol):
         }
     )
 
+
     if isinstance(
         result,
         list
     ):
+
         return result
+
 
     return []
 
@@ -858,6 +972,7 @@ def cancel_bot_stops(
             symbol
         )
 
+
         for order in orders:
 
             client_id = str(
@@ -867,10 +982,13 @@ def cancel_bot_stops(
                 )
             )
 
+
             if not client_id.startswith(
                 BOT_ALGO_PREFIX
             ):
+
                 continue
+
 
             algo_position_side = (
                 order.get(
@@ -879,16 +997,20 @@ def cancel_bot_stops(
                 )
             )
 
+
             if (
                 position_side != "BOTH"
                 and algo_position_side
                 != position_side
             ):
+
                 continue
+
 
             algo_id = order.get(
                 "algoId"
             )
+
 
             if algo_id:
 
@@ -897,14 +1019,16 @@ def cancel_bot_stops(
                     algo_id
                 )
 
+
                 log.info(
-                    "Cancelled bot stop "
-                    "%s algoId=%s",
+                    "Cancelled bot stop %s algoId=%s",
                     symbol,
                     algo_id
                 )
 
+
         return True
+
 
     except Exception as exc:
 
@@ -912,14 +1036,19 @@ def cancel_bot_stops(
             f"{symbol}:{position_side}"
         ] = str(exc)
 
+
         log.exception(
-            "Failed cancelling "
-            "Algo stop %s",
+            "Failed cancelling stop %s",
             symbol
         )
 
+
         return False
 
+
+# ============================================================
+# CREATE PROTECTIVE STOP
+# ============================================================
 
 def create_protective_stop(
     p,
@@ -935,13 +1064,16 @@ def create_protective_stop(
         p["positionAmt"]
     )
 
+
     if position_amt == 0:
         return False
+
 
     position_side = p.get(
         "positionSide",
         "BOTH"
     )
+
 
     close_side = (
         "SELL"
@@ -949,21 +1081,104 @@ def create_protective_stop(
         else "BUY"
     )
 
+
     stop_price = round_price(
         symbol,
         stop_price
     )
+
+
+    mark_price = float(
+        p.get(
+            "markPrice",
+            0
+        ) or 0
+    )
+
+
+    entry_price = float(
+        p.get(
+            "entryPrice",
+            0
+        ) or 0
+    )
+
+
+    log.warning(
+        "ARM STOP | %s | reason=%s | "
+        "entry=%s | mark=%s | trigger=%s | "
+        "positionAmt=%s",
+        symbol,
+        reason,
+        entry_price,
+        mark_price,
+        stop_price,
+        position_amt
+    )
+
+
+    # --------------------------------------------------------
+    # SAFETY VALIDATION
+    #
+    # LONG stop must be below current mark price.
+    # SHORT stop must be above current mark price.
+    # --------------------------------------------------------
+
+    numeric_stop = float(
+        stop_price
+    )
+
+
+    if mark_price > 0:
+
+        if (
+            position_amt > 0
+            and numeric_stop >= mark_price
+        ):
+
+            log.error(
+                "STOP REJECTED SAFETY | %s | "
+                "LONG stop=%s >= mark=%s",
+                symbol,
+                numeric_stop,
+                mark_price
+            )
+
+            return False
+
+
+        if (
+            position_amt < 0
+            and numeric_stop <= mark_price
+        ):
+
+            log.error(
+                "STOP REJECTED SAFETY | %s | "
+                "SHORT stop=%s <= mark=%s",
+                symbol,
+                numeric_stop,
+                mark_price
+            )
+
+            return False
+
+
+    # Cancel our old stop only after the new stop
+    # has passed basic directional validation.
+    # --------------------------------------------------------
 
     cancel_bot_stops(
         symbol,
         position_side
     )
 
+
     client_algo_id = (
         f"{BOT_ALGO_PREFIX}_"
         f"{reason[:4]}_"
         f"{int(time.time())}"
     )
+
 
     params = {
         "algoType":
@@ -991,11 +1206,13 @@ def create_protective_stop(
             client_algo_id
     }
 
+
     if position_side != "BOTH":
 
         params[
             "positionSide"
         ] = position_side
+
 
     try:
 
@@ -1007,20 +1224,23 @@ def create_protective_stop(
             )
         )
 
+
         last_errors.pop(
             position_key(p),
             None
         )
 
-        log.info(
-            "%s stop armed "
-            "%s at %s",
-            reason,
+
+        log.warning(
+            "STOP ARMED | %s | %s | trigger=%s",
             symbol,
+            reason,
             stop_price
         )
 
+
         return response
+
 
     except Exception as exc:
 
@@ -1028,17 +1248,18 @@ def create_protective_stop(
             position_key(p)
         ] = str(exc)
 
+
         log.exception(
-            "Failed creating "
-            "protective stop %s",
+            "Failed creating protective stop %s",
             symbol
         )
+
 
         return False
 
 
 # ============================================================
-# INITIAL STOP
+# INITIAL STOP PRICE
 # ============================================================
 
 def calculate_initial_stop_price(p):
@@ -1047,6 +1268,7 @@ def calculate_initial_stop_price(p):
         p["entryPrice"]
     )
 
+
     leverage = float(
         p.get(
             "leverage",
@@ -1054,12 +1276,15 @@ def calculate_initial_stop_price(p):
         ) or 1
     )
 
+
     position_amt = float(
         p["positionAmt"]
     )
 
+
     if leverage <= 0:
         leverage = 1
+
 
     adverse_fraction = (
         INITIAL_STOP_LOSS_ROI_PCT
@@ -1067,17 +1292,35 @@ def calculate_initial_stop_price(p):
         / leverage
     )
 
+
     if position_amt > 0:
 
-        return entry * (
-            1
+        stop = entry * (
+            1.0
             - adverse_fraction
         )
 
-    return entry * (
-        1
-        + adverse_fraction
+    else:
+
+        stop = entry * (
+            1.0
+            + adverse_fraction
+        )
+
+
+    log.info(
+        "INITIAL STOP CALC | %s | "
+        "entry=%s | leverage=%s | "
+        "ROI stop=-%s%% | price stop=%s",
+        p["symbol"],
+        entry,
+        leverage,
+        INITIAL_STOP_LOSS_ROI_PCT,
+        stop
     )
+
+
+    return stop
 
 
 def arm_initial_stop_loss(p):
@@ -1097,6 +1340,11 @@ def arm_initial_stop_loss(p):
 
 def get_breakeven_price(p):
 
+    # IMPORTANT:
+    # Use the actual Binance position ENTRY PRICE.
+    # Do not use Binance's separate breakEvenPrice field.
+    # --------------------------------------------------------
+
     entry_price = float(
         p.get(
             "entryPrice",
@@ -1104,12 +1352,14 @@ def get_breakeven_price(p):
         ) or 0
     )
 
+
     if entry_price <= 0:
 
         raise ValueError(
             f"Invalid entryPrice for "
             f"{p.get('symbol', 'UNKNOWN')}"
         )
+
 
     return entry_price
 
@@ -1137,26 +1387,31 @@ def execute_partial_take_profit(p):
         )
     )
 
+
     qty_to_close = (
         current_qty
         * PARTIAL_CLOSE_PCT
         / 100.0
     )
 
+
     result = close_position_quantity(
         p,
-        qty_to_close
+        qty_to_close,
+        reason="PARTIAL_TP"
     )
+
 
     if result:
 
-        log.info(
-            "%s partial TP %.2f%%",
+        log.warning(
+            "PARTIAL TP | %s | %.2f%% closed",
             p["symbol"],
             PARTIAL_CLOSE_PCT
         )
 
         return True
+
 
     return False
 
@@ -1171,17 +1426,25 @@ def get_or_create_state(p):
         p
     )
 
+
     state = position_states.get(
         key
     )
+
+
+    current_entry = float(
+        p["entryPrice"]
+    )
+
 
     if state is None:
 
         state = {
             "entry_price":
-                float(
-                    p["entryPrice"]
-                ),
+                current_entry,
+
+            "opened_at":
+                time.time(),
 
             "initial_stop_armed":
                 False,
@@ -1193,15 +1456,72 @@ def get_or_create_state(p):
                 False
         }
 
+
         position_states[
             key
         ] = state
+
+
+        log.info(
+            "NEW POSITION STATE | %s | entry=%s",
+            key,
+            current_entry
+        )
+
+
+    # --------------------------------------------------------
+    # Detect a genuinely new position that reused same key.
+    # --------------------------------------------------------
+
+    elif abs(
+        state.get(
+            "entry_price",
+            0
+        )
+        - current_entry
+    ) > max(
+        abs(current_entry) * 0.000001,
+        0.0000000001
+    ):
+
+        log.warning(
+            "POSITION ENTRY CHANGED | %s | old=%s new=%s",
+            key,
+            state.get(
+                "entry_price"
+            ),
+            current_entry
+        )
+
+
+        state = {
+            "entry_price":
+                current_entry,
+
+            "opened_at":
+                time.time(),
+
+            "initial_stop_armed":
+                False,
+
+            "breakeven_armed":
+                False,
+
+            "partial_tp_done":
+                False
+        }
+
+
+        position_states[
+            key
+        ] = state
+
 
     return state
 
 
 # ============================================================
-# TRADINGVIEW SYMBOL NORMALIZATION
+# SYMBOL NORMALIZATION
 # ============================================================
 
 def normalize_symbol(raw_symbol):
@@ -1210,11 +1530,13 @@ def normalize_symbol(raw_symbol):
         raw_symbol
     ).upper().strip()
 
+
     if ":" in symbol:
 
         symbol = symbol.split(
             ":"
         )[-1]
+
 
     if symbol.endswith(
         ".P"
@@ -1223,6 +1545,7 @@ def normalize_symbol(raw_symbol):
         symbol = symbol[
             :-2
         ]
+
 
     symbol = symbol.replace(
         "/",
@@ -1239,6 +1562,7 @@ def normalize_symbol(raw_symbol):
         ""
     )
 
+
     return symbol
 
 
@@ -1252,12 +1576,13 @@ def validate_futures_symbol(symbol):
         symbol
     )
 
+
     if info is None:
 
         raise ValueError(
-            f"{symbol} is not a "
-            f"Binance Futures symbol"
+            f"{symbol} is not a Binance Futures symbol"
         )
+
 
     status = str(
         info.get(
@@ -1266,21 +1591,22 @@ def validate_futures_symbol(symbol):
         )
     ).upper()
 
+
     if (
         status
         and status != "TRADING"
     ):
 
         raise ValueError(
-            f"{symbol} is not "
-            f"currently trading"
+            f"{symbol} is not currently trading"
         )
+
 
     return info
 
 
 # ============================================================
-# PRICE AND LEVERAGE
+# PRICE / LEVERAGE
 # ============================================================
 
 def get_futures_price(symbol):
@@ -1290,6 +1616,7 @@ def get_futures_price(symbol):
             symbol=symbol
         )
     )
+
 
     return float(
         ticker["price"]
@@ -1305,11 +1632,13 @@ def set_symbol_leverage(symbol):
         )
     )
 
-    log.info(
-        "%s leverage set to %sx",
+
+    log.warning(
+        "LEVERAGE SET | %s | %sx",
         symbol,
         ENTRY_LEVERAGE
     )
+
 
     return result
 
@@ -1324,34 +1653,38 @@ def calculate_entry_quantity(symbol):
         symbol
     )
 
+
     if price <= 0:
 
         raise ValueError(
-            f"Invalid market price "
-            f"for {symbol}"
+            f"Invalid market price for {symbol}"
         )
+
 
     notional = (
         ORDER_MARGIN_USDT
         * ENTRY_LEVERAGE
     )
 
+
     raw_quantity = (
         notional
         / price
     )
+
 
     quantity = round_quantity_down(
         symbol,
         raw_quantity
     )
 
+
     if quantity <= 0:
 
         raise ValueError(
-            f"Calculated quantity "
-            f"for {symbol} is zero"
+            f"Calculated quantity for {symbol} is zero"
         )
+
 
     return (
         quantity,
@@ -1377,11 +1710,27 @@ def open_market_position(
         symbol
     )
 
+
     side = (
         SIDE_BUY
         if signal == "BUY"
         else SIDE_SELL
     )
+
+
+    log.warning(
+        "OPENING POSITION | %s | %s | "
+        "qty=%s | market≈%s | margin=$%.2f | "
+        "leverage=%sx | notional≈$%.2f",
+        signal,
+        symbol,
+        quantity,
+        price,
+        ORDER_MARGIN_USDT,
+        ENTRY_LEVERAGE,
+        notional
+    )
+
 
     order = (
         client.futures_create_order(
@@ -1392,20 +1741,53 @@ def open_market_position(
         )
     )
 
+
     log.warning(
-        "ENTRY %s %s qty=%s "
-        "price≈%s margin=%s "
-        "leverage=%sx notional≈%s",
+        "ENTRY EXECUTED | %s | %s | orderId=%s",
         signal,
         symbol,
-        quantity,
-        price,
-        ORDER_MARGIN_USDT,
-        ENTRY_LEVERAGE,
-        notional
+        order.get(
+            "orderId"
+        )
     )
 
+
     return order
+
+
+# ============================================================
+# WAIT FOR POSITION TO APPEAR
+# ============================================================
+
+def wait_for_position(
+    symbol,
+    timeout_seconds=8
+):
+
+    started = time.time()
+
+
+    while (
+        time.time()
+        - started
+        < timeout_seconds
+    ):
+
+        current = get_any_symbol_position(
+            symbol
+        )
+
+
+        if current is not None:
+            return current
+
+
+        time.sleep(
+            0.25
+        )
+
+
+    return None
 
 
 # ============================================================
@@ -1419,24 +1801,26 @@ def wait_until_position_closed(
 
     started = time.time()
 
+
     while (
         time.time()
         - started
         < timeout_seconds
     ):
 
-        current = (
-            get_any_symbol_position(
-                symbol
-            )
+        current = get_any_symbol_position(
+            symbol
         )
+
 
         if current is None:
             return True
 
+
         time.sleep(
-            0.75
+            0.5
         )
+
 
     return False
 
@@ -1445,14 +1829,14 @@ def wait_until_position_closed(
 # PROCESS TRADINGVIEW SIGNAL
 #
 # BUY:
-#   No position -> LONG
-#   Existing LONG -> IGNORE
-#   Existing SHORT -> CLOSE + LONG
+#   No position       -> LONG
+#   Existing LONG     -> IGNORE
+#   Existing SHORT    -> CLOSE SHORT + LONG
 #
 # SELL:
-#   No position -> SHORT
-#   Existing SHORT -> IGNORE
-#   Existing LONG -> CLOSE + SHORT
+#   No position       -> SHORT
+#   Existing SHORT    -> IGNORE
+#   Existing LONG     -> CLOSE LONG + SHORT
 # ============================================================
 
 def process_entry_signal(
@@ -1464,9 +1848,11 @@ def process_entry_signal(
         signal
     ).upper().strip()
 
+
     symbol = normalize_symbol(
         raw_symbol
     )
+
 
     if signal not in (
         "BUY",
@@ -1474,21 +1860,25 @@ def process_entry_signal(
     ):
 
         raise ValueError(
-            "Signal must be "
-            "BUY or SELL"
+            "Signal must be BUY or SELL"
         )
+
 
     validate_futures_symbol(
         symbol
     )
 
+
     with entry_lock:
 
-        current = (
-            get_any_symbol_position(
-                symbol
-            )
+        current = get_any_symbol_position(
+            symbol
         )
+
+
+        # ====================================================
+        # EXISTING POSITION
+        # ====================================================
 
         if current:
 
@@ -1498,31 +1888,37 @@ def process_entry_signal(
                 ]
             )
 
+
             current_direction = (
                 "BUY"
                 if amount > 0
                 else "SELL"
             )
 
+
+            # ------------------------------------------------
+            # SAME DIRECTION = DO NOTHING
+            # ------------------------------------------------
+
             if (
                 current_direction
                 == signal
             ):
 
-                log.info(
-                    "%s %s ignored - "
+                log.warning(
+                    "SIGNAL IGNORED | %s | %s | "
                     "already in same direction",
                     signal,
                     symbol
                 )
+
 
                 return {
                     "status":
                         "ignored",
 
                     "reason":
-                        "same_direction_"
-                        "position_exists",
+                        "same_direction_position_exists",
 
                     "signal":
                         signal,
@@ -1531,14 +1927,19 @@ def process_entry_signal(
                         symbol
                 }
 
+
+            # ------------------------------------------------
+            # OPPOSITE SIGNAL = REVERSE
+            # ------------------------------------------------
+
             log.warning(
-                "%s opposite signal "
-                "received for %s; "
-                "closing current %s position",
+                "OPPOSITE SIGNAL | %s | %s | "
+                "current=%s | reversing",
                 signal,
                 symbol,
                 current_direction
             )
+
 
             cancel_bot_stops(
                 symbol,
@@ -1548,30 +1949,33 @@ def process_entry_signal(
                 )
             )
 
+
             close_result = close_position(
-                current
+                current,
+                reason=f"OPPOSITE_{signal}_SIGNAL"
             )
+
 
             if not close_result:
 
                 raise RuntimeError(
-                    f"Could not close "
-                    f"existing {symbol} "
-                    f"position"
+                    f"Could not close existing "
+                    f"{symbol} position"
                 )
 
-            closed = (
-                wait_until_position_closed(
-                    symbol
-                )
+
+            closed = wait_until_position_closed(
+                symbol
             )
+
 
             if not closed:
 
                 raise RuntimeError(
-                    f"{symbol} position "
-                    f"did not close in time"
+                    f"{symbol} position did not "
+                    f"close in time"
                 )
+
 
             position_states.pop(
                 position_key(
@@ -1580,26 +1984,37 @@ def process_entry_signal(
                 None
             )
 
+
+        # ====================================================
+        # SET LEVERAGE
+        # ====================================================
+
         set_symbol_leverage(
             symbol
         )
+
+
+        # ====================================================
+        # OPEN NEW POSITION
+        # ====================================================
 
         order = open_market_position(
             symbol,
             signal
         )
 
-        time.sleep(
-            0.75
+
+        # ====================================================
+        # WAIT UNTIL BINANCE CONFIRMS POSITION
+        # ====================================================
+
+        new_position = wait_for_position(
+            symbol
         )
 
-        new_position = (
-            get_any_symbol_position(
-                symbol
-            )
-        )
 
         stop_armed = False
+
 
         if new_position:
 
@@ -1607,17 +2022,34 @@ def process_entry_signal(
                 new_position
             )
 
+
+            # Record actual creation time explicitly.
+            state[
+                "opened_at"
+            ] = time.time()
+
+
             stop_armed = bool(
                 arm_initial_stop_loss(
                     new_position
                 )
             )
 
+
             if stop_armed:
 
                 state[
                     "initial_stop_armed"
                 ] = True
+
+
+        else:
+
+            log.error(
+                "POSITION NOT FOUND AFTER ENTRY | %s",
+                symbol
+            )
+
 
         return {
             "status":
@@ -1650,6 +2082,55 @@ def process_entry_signal(
 
 
 # ============================================================
+# BACKGROUND SIGNAL PROCESSOR
+# ============================================================
+
+def process_signal_background(
+    signal,
+    symbol
+):
+
+    try:
+
+        log.warning(
+            "BACKGROUND PROCESS START | %s | %s",
+            signal,
+            symbol
+        )
+
+
+        result = process_entry_signal(
+            signal,
+            symbol
+        )
+
+
+        log.warning(
+            "BACKGROUND PROCESS COMPLETE | %s",
+            result
+        )
+
+
+    except Exception as exc:
+
+        normalized = normalize_symbol(
+            symbol
+        )
+
+
+        last_errors[
+            f"ENTRY:{normalized}"
+        ] = str(exc)
+
+
+        log.exception(
+            "BACKGROUND SIGNAL FAILED | %s | %s",
+            signal,
+            symbol
+        )
+
+
+# ============================================================
 # MAIN RISK MONITOR
 # ============================================================
 
@@ -1657,15 +2138,18 @@ def check_positions():
 
     global last_snapshot
 
-    # Only one all-position request per monitoring cycle.
-    open_positions = (
-        get_open_positions()
-    )
+
+    open_positions = get_open_positions()
+
 
     current_keys = {
         position_key(p)
         for p in open_positions
     }
+
+
+    # Remove state belonging to positions that no longer exist.
+    # --------------------------------------------------------
 
     for key in list(
         position_states.keys()
@@ -1678,9 +2162,11 @@ def check_positions():
                 None
             )
 
+
     snapshot_positions = []
 
     total_unrealized = 0.0
+
 
     for p in open_positions:
 
@@ -1688,22 +2174,27 @@ def check_positions():
             "symbol"
         ]
 
+
         position_side = p.get(
             "positionSide",
             "BOTH"
         )
 
+
         key = position_key(
             p
         )
+
 
         state = get_or_create_state(
             p
         )
 
+
         roi = calculate_roi_pct(
             p
         )
+
 
         unrealized = float(
             p.get(
@@ -1717,34 +2208,73 @@ def check_positions():
             or 0
         )
 
-        total_unrealized += (
-            unrealized
+
+        total_unrealized += unrealized
+
+
+        opened_at = float(
+            state.get(
+                "opened_at",
+                time.time()
+            )
         )
 
-        log.info(
-            "%s ROI %.2f%%",
-            symbol,
-            roi
+
+        position_age = (
+            time.time()
+            - opened_at
         )
+
+
+        log.info(
+            "POSITION | %s | ROI=%.2f%% | "
+            "PnL=%.4f | age=%.1fs | "
+            "initialSL=%s | BE=%s | partial=%s",
+            symbol,
+            roi,
+            unrealized,
+            position_age,
+            state[
+                "initial_stop_armed"
+            ],
+            state[
+                "breakeven_armed"
+            ],
+            state[
+                "partial_tp_done"
+            ]
+        )
+
 
         # ====================================================
         # HARD SOFTWARE STOP
+        #
+        # Grace period prevents a just-created position from
+        # being immediately software-closed because Binance
+        # position fields are still settling.
+        #
+        # Hardware/Algo protective stop remains active.
         # ====================================================
 
         if (
-            roi
+            position_age
+            >= ENTRY_GRACE_SECONDS
+            and roi
             <= -INITIAL_STOP_LOSS_ROI_PCT
         ):
 
             log.warning(
-                "%s ROI %.2f%% "
-                "HARD STOP",
+                "HARD STOP TRIGGER | %s | "
+                "ROI %.2f%% <= -%.2f%%",
                 symbol,
-                roi
+                roi,
+                INITIAL_STOP_LOSS_ROI_PCT
             )
 
+
             if close_position(
-                p
+                p,
+                reason="HARD_SOFTWARE_STOP"
             ):
 
                 cancel_bot_stops(
@@ -1752,12 +2282,15 @@ def check_positions():
                     position_side
                 )
 
+
                 position_states.pop(
                     key,
                     None
                 )
 
+
             continue
+
 
         # ====================================================
         # FINAL TAKE PROFIT
@@ -1768,15 +2301,18 @@ def check_positions():
             >= FINAL_TP_ROI_PCT
         ):
 
-            log.info(
-                "%s ROI %.2f%% "
-                "FINAL TP",
+            log.warning(
+                "FINAL TP TRIGGER | %s | "
+                "ROI %.2f%% >= %.2f%%",
                 symbol,
-                roi
+                roi,
+                FINAL_TP_ROI_PCT
             )
 
+
             if close_position(
-                p
+                p,
+                reason="FINAL_TAKE_PROFIT"
             ):
 
                 cancel_bot_stops(
@@ -1784,12 +2320,15 @@ def check_positions():
                     position_side
                 )
 
+
                 position_states.pop(
                     key,
                     None
                 )
 
+
             continue
+
 
         # ====================================================
         # BREAKEVEN
@@ -1803,11 +2342,17 @@ def check_positions():
             ]
         ):
 
-            result = (
-                move_stop_to_breakeven(
-                    p
-                )
+            log.warning(
+                "BREAKEVEN TRIGGER | %s | ROI %.2f%%",
+                symbol,
+                roi
             )
+
+
+            result = move_stop_to_breakeven(
+                p
+            )
+
 
             if result:
 
@@ -1819,8 +2364,9 @@ def check_positions():
                     "initial_stop_armed"
                 ] = False
 
+
         # ====================================================
-        # INITIAL PROTECTIVE STOP
+        # ENSURE INITIAL STOP EXISTS
         # ====================================================
 
         elif (
@@ -1832,17 +2378,17 @@ def check_positions():
             ]
         ):
 
-            result = (
-                arm_initial_stop_loss(
-                    p
-                )
+            result = arm_initial_stop_loss(
+                p
             )
+
 
             if result:
 
                 state[
                     "initial_stop_armed"
                 ] = True
+
 
         # ====================================================
         # PARTIAL TAKE PROFIT
@@ -1856,11 +2402,10 @@ def check_positions():
             ]
         ):
 
-            result = (
-                execute_partial_take_profit(
-                    p
-                )
+            result = execute_partial_take_profit(
+                p
             )
+
 
             if result:
 
@@ -1868,16 +2413,17 @@ def check_positions():
                     "partial_tp_done"
                 ] = True
 
+
                 time.sleep(
                     0.75
                 )
 
-                remaining = (
-                    get_current_position(
-                        symbol,
-                        position_side
-                    )
+
+                remaining = get_current_position(
+                    symbol,
+                    position_side
                 )
+
 
                 if remaining:
 
@@ -1886,6 +2432,7 @@ def check_positions():
                             remaining
                         )
                     )
+
 
                     if breakeven_result:
 
@@ -1896,6 +2443,11 @@ def check_positions():
                         state[
                             "initial_stop_armed"
                         ] = False
+
+
+        # ====================================================
+        # STATUS SNAPSHOT
+        # ====================================================
 
         snapshot_positions.append(
             {
@@ -1940,6 +2492,12 @@ def check_positions():
                         2
                     ),
 
+                "positionAgeSeconds":
+                    round(
+                        position_age,
+                        1
+                    ),
+
                 "initialStopArmed":
                     state[
                         "initial_stop_armed"
@@ -1962,6 +2520,7 @@ def check_positions():
             }
         )
 
+
     # ========================================================
     # OPTIONAL PORTFOLIO EXIT
     # ========================================================
@@ -1973,18 +2532,19 @@ def check_positions():
     ):
 
         log.warning(
-            "Portfolio target reached "
-            "%.2f >= %.2f",
+            "PORTFOLIO TARGET | %.2f >= %.2f",
             total_unrealized,
             PORTFOLIO_PROFIT_USD
         )
 
-        # Reuse positions fetched at the start of this cycle.
+
         for p in open_positions:
 
             close_position(
-                p
+                p,
+                reason="PORTFOLIO_PROFIT_TARGET"
             )
+
 
             cancel_bot_stops(
                 p["symbol"],
@@ -1994,7 +2554,9 @@ def check_positions():
                 )
             )
 
+
         position_states.clear()
+
 
     last_snapshot = {
         "last_run":
@@ -2012,33 +2574,34 @@ def check_positions():
 
 
 # ============================================================
-# MONITOR LOOP WITH RATE-LIMIT BACKOFF
+# MONITOR LOOP
 # ============================================================
 
 def monitor_loop():
 
-    log.info(
-        "BINANCE manager started"
+    log.warning(
+        "================================================"
     )
 
-    log.info(
+    log.warning(
+        "MAQ BINANCE MANAGER STARTED"
+    )
+
+    log.warning(
         "TradingView entries ENABLED"
     )
 
-    log.info(
-        "Entry margin $%.2f | "
-        "leverage %sx | poll %ss",
+    log.warning(
+        "Margin=$%.2f | leverage=%sx | poll=%ss",
         ORDER_MARGIN_USDT,
         ENTRY_LEVERAGE,
         POLL_INTERVAL_SECONDS
     )
 
-    log.info(
-        "SL -%.2f%% | "
-        "BE +%.2f%% | "
-        "Partial +%.2f%% "
-        "close %.2f%% | "
-        "Final +%.2f%%",
+    log.warning(
+        "SL=-%.2f%% ROI | BE=+%.2f%% ROI | "
+        "Partial=+%.2f%% ROI close %.2f%% | "
+        "Final=+%.2f%% ROI",
         INITIAL_STOP_LOSS_ROI_PCT,
         BREAKEVEN_TRIGGER_ROI_PCT,
         PARTIAL_TP_ROI_PCT,
@@ -2046,7 +2609,18 @@ def monitor_loop():
         FINAL_TP_ROI_PCT
     )
 
+    log.warning(
+        "Software entry grace=%ss",
+        ENTRY_GRACE_SECONDS
+    )
+
+    log.warning(
+        "================================================"
+    )
+
+
     rate_limit_backoff = 60
+
 
     while True:
 
@@ -2060,31 +2634,35 @@ def monitor_loop():
                 POLL_INTERVAL_SECONDS
             )
 
+
         except Exception as exc:
 
             log.exception(
                 "Monitor iteration failed"
             )
 
+
             if is_binance_rate_limit_error(
                 exc
             ):
 
                 log.warning(
-                    "Binance rate limit "
-                    "reached; pausing "
-                    "%s seconds",
+                    "Binance rate limit reached; "
+                    "pausing %s seconds",
                     rate_limit_backoff
                 )
+
 
                 time.sleep(
                     rate_limit_backoff
                 )
 
+
                 rate_limit_backoff = min(
                     rate_limit_backoff * 2,
                     600
                 )
+
 
             else:
 
@@ -2094,7 +2672,7 @@ def monitor_loop():
 
 
 # ============================================================
-# HEALTH ROUTE
+# HEALTH
 # ============================================================
 
 @app.route("/")
@@ -2106,16 +2684,19 @@ def health():
                 "ok",
 
             "service":
-                "binance-risk-manager",
+                "MAQ-binance-risk-manager",
 
             "mode":
-                "TRADINGVIEW_BINANCE"
+                "TRADINGVIEW_BINANCE",
+
+            "webhook_mode":
+                "ASYNC_FAST_ACK"
         }
     )
 
 
 # ============================================================
-# STATUS ROUTE
+# STATUS
 # ============================================================
 
 @app.route("/status")
@@ -2126,7 +2707,11 @@ def status():
             "mode":
                 "TRADINGVIEW_BINANCE",
 
+            "webhook_mode":
+                "ASYNC_FAST_ACK",
+
             "entry_config": {
+
                 "order_margin_usdt":
                     ORDER_MARGIN_USDT,
 
@@ -2135,10 +2720,14 @@ def status():
 
                 "approx_notional_usdt":
                     ORDER_MARGIN_USDT
-                    * ENTRY_LEVERAGE
+                    * ENTRY_LEVERAGE,
+
+                "entry_grace_seconds":
+                    ENTRY_GRACE_SECONDS
             },
 
             "risk_config": {
+
                 "poll_interval_seconds":
                     POLL_INTERVAL_SECONDS,
 
@@ -2184,12 +2773,22 @@ def status():
 # ============================================================
 # TRADINGVIEW WEBHOOK
 #
-# ACCEPTED TEXT:
+# ACCEPTED:
+#
 # BUY|BTCUSDT
 # SELL|BTCUSDT
 #
-# ACCEPTED JSON:
+# BUY|BTCUSDT.P
+# SELL|BTCUSDT.P
+#
+# JSON:
 # {"signal":"BUY","symbol":"BTCUSDT"}
+#
+# IMPORTANT:
+# This route DOES NOT wait for Binance.
+#
+# TradingView gets HTTP 200 immediately.
+# Binance processing happens in background.
 # ============================================================
 
 @app.route(
@@ -2203,6 +2802,7 @@ def tradingview_webhook():
         signal = None
         symbol = None
 
+
         # ----------------------------------------------------
         # JSON PAYLOAD
         # ----------------------------------------------------
@@ -2213,6 +2813,7 @@ def tradingview_webhook():
                 silent=True
             ) or {}
 
+
             signal = data.get(
                 "signal"
             )
@@ -2220,6 +2821,7 @@ def tradingview_webhook():
             symbol = data.get(
                 "symbol"
             )
+
 
         # ----------------------------------------------------
         # TEXT PAYLOAD
@@ -2231,10 +2833,12 @@ def tradingview_webhook():
                 as_text=True
             ).strip()
 
+
             log.warning(
                 "TradingView raw payload: %s",
                 raw[:200]
             )
+
 
             if "|" in raw:
 
@@ -2242,6 +2846,11 @@ def tradingview_webhook():
                     "|",
                     1
                 )
+
+
+        # ----------------------------------------------------
+        # VALIDATE BASIC PAYLOAD
+        # ----------------------------------------------------
 
         if not signal or not symbol:
 
@@ -2251,41 +2860,96 @@ def tradingview_webhook():
                         "error",
 
                     "error":
-                        "Expected "
-                        "BUY|BTCUSDT or "
-                        "SELL|BTCUSDT"
+                        "Expected BUY|BTCUSDT "
+                        "or SELL|BTCUSDT"
                 }
             ), 400
 
-        log.warning(
-            "TradingView webhook "
-            "received: %s | %s",
-            signal,
+
+        signal = str(
+            signal
+        ).upper().strip()
+
+
+        symbol = str(
+            symbol
+        ).upper().strip()
+
+
+        if signal not in (
+            "BUY",
+            "SELL"
+        ):
+
+            return jsonify(
+                {
+                    "status":
+                        "error",
+
+                    "error":
+                        "Signal must be BUY or SELL"
+                }
+            ), 400
+
+
+        normalized_symbol = normalize_symbol(
             symbol
         )
 
-        result = process_entry_signal(
+
+        log.warning(
+            "WEBHOOK ACCEPTED | %s | %s -> %s",
             signal,
-            symbol
+            symbol,
+            normalized_symbol
         )
+
+
+        # ====================================================
+        # PROCESS BINANCE IN BACKGROUND
+        # ====================================================
+
+        worker = threading.Thread(
+            target=process_signal_background,
+            args=(
+                signal,
+                symbol
+            ),
+            daemon=True,
+            name=f"TV-{signal}-{normalized_symbol}"
+        )
+
+
+        worker.start()
+
+
+        # ====================================================
+        # IMMEDIATE RESPONSE TO TRADINGVIEW
+        # ====================================================
 
         return jsonify(
-            result
+            {
+                "status":
+                    "accepted",
+
+                "signal":
+                    signal,
+
+                "symbol":
+                    normalized_symbol,
+
+                "processing":
+                    "background"
+            }
         ), 200
+
 
     except Exception as exc:
 
         log.exception(
-            "TradingView webhook failed"
+            "TradingView webhook acceptance failed"
         )
 
-        status_code = (
-            429
-            if is_binance_rate_limit_error(
-                exc
-            )
-            else 500
-        )
 
         return jsonify(
             {
@@ -2295,29 +2959,33 @@ def tradingview_webhook():
                 "error":
                     str(exc)
             }
-        ), status_code
+        ), 500
 
 
 # ============================================================
-# START MONITOR ONCE PER PYTHON PROCESS
+# START MONITOR ONCE
 # ============================================================
 
 def start_monitor():
 
     global monitor_started
 
+
     with monitor_start_lock:
 
         if monitor_started:
             return
 
+
         monitor_started = True
+
 
         thread = threading.Thread(
             target=monitor_loop,
             daemon=True,
             name="binance-position-monitor"
         )
+
 
         thread.start()
 
@@ -2337,6 +3005,7 @@ if __name__ == "__main__":
             8080
         )
     )
+
 
     app.run(
         host="0.0.0.0",
