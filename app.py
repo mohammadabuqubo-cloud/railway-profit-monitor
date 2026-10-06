@@ -25,7 +25,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-log = logging.getLogger("MAQ-BINANCE-V2")
+log = logging.getLogger("MAQ-BINANCE-V3")
 
 
 # ============================================================
@@ -81,8 +81,7 @@ BINANCE_TESTNET = (
 
 # ============================================================
 # ENTRY CONFIG
-#
-# THESE TWO REMAIN CONTROLLED FROM RAILWAY
+# RAILWAY VARIABLES
 # ============================================================
 
 ORDER_MARGIN_USDT = env_float(
@@ -97,28 +96,53 @@ ENTRY_LEVERAGE = env_int(
 
 
 # ============================================================
-# LOCKED RISK RULES
+# RISK CONFIG
 #
-# IMPORTANT:
+# ALL VALUES BELOW ARE READ FROM RAILWAY VARIABLES.
 #
-# These are intentionally NOT read from Railway environment
-# variables in this version.
+# Railway is the single source of truth.
 #
-# This prevents an old/wrong Railway variable from changing
-# TP1 / BE / SL behavior.
+# Example:
+#
+# INITIAL_STOP_LOSS_ROI_PCT=100
+# FINAL_TP_ROI_PCT=100
+#
+# means:
+# Initial SL = -100% ROI
+# Final TP  = +100% ROI
+#
+# After changing Railway variables, redeploy/restart the service.
 # ============================================================
 
-INITIAL_STOP_LOSS_ROI_PCT = 20.0
+INITIAL_STOP_LOSS_ROI_PCT = env_float(
+    "INITIAL_STOP_LOSS_ROI_PCT",
+    20.0
+)
 
-BREAKEVEN_TRIGGER_ROI_PCT = 10.0
+BREAKEVEN_TRIGGER_ROI_PCT = env_float(
+    "BREAKEVEN_TRIGGER_ROI_PCT",
+    10.0
+)
 
-PARTIAL_TP_ROI_PCT = 20.0
+PARTIAL_TP_ROI_PCT = env_float(
+    "PARTIAL_TP_ROI_PCT",
+    20.0
+)
 
-PARTIAL_CLOSE_PCT = 50.0
+PARTIAL_CLOSE_PCT = env_float(
+    "PARTIAL_CLOSE_PCT",
+    50.0
+)
 
-FINAL_TP_ROI_PCT = 60.0
+FINAL_TP_ROI_PCT = env_float(
+    "FINAL_TP_ROI_PCT",
+    60.0
+)
 
-PORTFOLIO_PROFIT_USD = 0.0
+PORTFOLIO_PROFIT_USD = env_float(
+    "PORTFOLIO_PROFIT_USD",
+    0.0
+)
 
 
 # ============================================================
@@ -421,12 +445,6 @@ def round_stop_price(
 
     value = Decimal(str(price))
 
-    # LONG stop:
-    # round down so stop isn't accidentally moved closer.
-    #
-    # SHORT stop:
-    # round up for the same reason.
-
     rounding_mode = (
         ROUND_DOWN
         if position_amt > 0
@@ -520,24 +538,13 @@ def get_current_position(
 
 
 # ============================================================
-# ROI CALCULATION — V2
-#
-# IMPORTANT FIX
-#
-# We do NOT calculate the trading trigger from Binance's
-# positionInitialMargin anymore.
+# ROI CALCULATION
 #
 # LONG:
 # ((mark - entry) / entry) * leverage * 100
 #
 # SHORT:
 # ((entry - mark) / entry) * leverage * 100
-#
-# Example:
-#
-# 10x leverage
-# +2% price move
-# = approximately +20% ROI
 # ============================================================
 
 def calculate_roi_pct(p):
@@ -862,7 +869,7 @@ def cancel_bot_stops(
 
         return True
 
-    except Exception as exc:
+    except Exception:
 
         log.exception(
             "STOP CANCEL FAILED | %s",
@@ -929,10 +936,6 @@ def create_protective_stop(
         mark,
         rounded_stop
     )
-
-    # ========================================================
-    # SAFETY CHECK
-    # ========================================================
 
     if mark > 0:
 
@@ -1027,6 +1030,8 @@ def create_protective_stop(
 
 # ============================================================
 # INITIAL STOP
+#
+# Uses Railway INITIAL_STOP_LOSS_ROI_PCT
 # ============================================================
 
 def calculate_initial_stop_price(p):
@@ -1559,7 +1564,7 @@ def check_positions():
         )
 
         # ====================================================
-        # VERY IMPORTANT DEBUG LINE
+        # DEBUG — SHOW ACTUAL RAILWAY VALUES
         # ====================================================
 
         log.info(
@@ -1568,7 +1573,7 @@ def check_positions():
             "SL=-%.2f%% | "
             "BE=+%.2f%% | "
             "TP1=+%.2f%% | "
-            "TP1_CLOSE=%.0f%% | "
+            "TP1_CLOSE=%.2f%% | "
             "FINAL=+%.2f%% | "
             "age=%.1fs",
             symbol,
@@ -1582,7 +1587,8 @@ def check_positions():
         )
 
         # ====================================================
-        # HARD STOP
+        # HARD SOFTWARE STOP
+        # Railway: INITIAL_STOP_LOSS_ROI_PCT
         # ====================================================
 
         if (
@@ -1592,9 +1598,11 @@ def check_positions():
         ):
 
             log.warning(
-                "SL TRIGGER | %s | ROI=%.2f%%",
+                "SL TRIGGER | %s | "
+                "ROI=%.2f%% <= -%.2f%%",
                 symbol,
-                roi
+                roi,
+                INITIAL_STOP_LOSS_ROI_PCT
             )
 
             if close_position(
@@ -1618,10 +1626,13 @@ def check_positions():
             continue
 
         # ====================================================
-        # FINAL TP +60%
+        # FINAL TP
+        # Railway: FINAL_TP_ROI_PCT
         # ====================================================
 
         if (
+            FINAL_TP_ROI_PCT > 0
+            and
             roi >= FINAL_TP_ROI_PCT
         ):
 
@@ -1635,7 +1646,7 @@ def check_positions():
 
             if close_position(
                 p,
-                "FINAL_TP_60_ROI"
+                "FINAL_TP"
             ):
 
                 cancel_bot_stops(
@@ -1654,24 +1665,30 @@ def check_positions():
             continue
 
         # ====================================================
-        # PARTIAL TP +20%
-        #
-        # THIS CONDITION IS EXPLICIT.
-        #
-        # A ROI OF +0.15 CANNOT PASS THIS CONDITION.
+        # PARTIAL TP
+        # Railway:
+        # PARTIAL_TP_ROI_PCT
+        # PARTIAL_CLOSE_PCT
         # ====================================================
 
         if (
-            roi >= 20.0
+            PARTIAL_TP_ROI_PCT > 0
+            and
+            PARTIAL_CLOSE_PCT > 0
+            and
+            roi >= PARTIAL_TP_ROI_PCT
             and
             not state["partial_tp_done"]
         ):
 
             log.warning(
                 "TP1 TRIGGER | %s | "
-                "ROI=%.2f%% >= 20.00%%",
+                "ROI=%.2f%% >= %.2f%% | "
+                "close=%.2f%%",
                 symbol,
-                roi
+                roi,
+                PARTIAL_TP_ROI_PCT,
+                PARTIAL_CLOSE_PCT
             )
 
             current_qty = abs(
@@ -1680,16 +1697,27 @@ def check_positions():
                 )
             )
 
+            close_fraction = (
+                min(
+                    max(
+                        PARTIAL_CLOSE_PCT,
+                        0.0
+                    ),
+                    100.0
+                )
+                / 100.0
+            )
+
             qty_to_close = (
                 current_qty
-                * 0.50
+                * close_fraction
             )
 
             result = (
                 close_position_quantity(
                     p,
                     qty_to_close,
-                    "PARTIAL_TP_20_ROI_CLOSE_50"
+                    "PARTIAL_TP"
                 )
             )
 
@@ -1701,8 +1729,9 @@ def check_positions():
 
                 log.warning(
                     "TP1 COMPLETE | %s | "
-                    "50%% closed at ROI %.2f%%",
+                    "%.2f%% closed at ROI %.2f%%",
                     symbol,
+                    PARTIAL_CLOSE_PCT,
                     roi
                 )
 
@@ -1740,24 +1769,27 @@ def check_positions():
             continue
 
         # ====================================================
-        # BREAKEVEN +10%
+        # BREAKEVEN
+        # Railway: BREAKEVEN_TRIGGER_ROI_PCT
         #
-        # This does NOT close anything.
-        #
-        # It only replaces the initial stop with entry price.
+        # Does NOT close the position.
+        # Moves stop to entry.
         # ====================================================
 
         if (
-            roi >= 10.0
+            BREAKEVEN_TRIGGER_ROI_PCT > 0
+            and
+            roi >= BREAKEVEN_TRIGGER_ROI_PCT
             and
             not state["breakeven_armed"]
         ):
 
             log.warning(
                 "BE TRIGGER | %s | "
-                "ROI=%.2f%% >= 10.00%%",
+                "ROI=%.2f%% >= %.2f%%",
                 symbol,
-                roi
+                roi,
+                BREAKEVEN_TRIGGER_ROI_PCT
             )
 
             if move_stop_to_breakeven(p):
@@ -1855,6 +1887,58 @@ def check_positions():
             }
         )
 
+    # ========================================================
+    # OPTIONAL PORTFOLIO PROFIT EXIT
+    #
+    # 0 = disabled
+    # Positive value = close all positions when total
+    # unrealized profit reaches the Railway value.
+    # ========================================================
+
+    if (
+        PORTFOLIO_PROFIT_USD > 0
+        and
+        total_unrealized >= PORTFOLIO_PROFIT_USD
+        and
+        positions
+    ):
+
+        log.warning(
+            "PORTFOLIO PROFIT TARGET | "
+            "profit=$%.4f >= target=$%.4f",
+            total_unrealized,
+            PORTFOLIO_PROFIT_USD
+        )
+
+        for p in positions:
+
+            try:
+
+                if close_position(
+                    p,
+                    "PORTFOLIO_PROFIT_TARGET"
+                ):
+
+                    cancel_bot_stops(
+                        p["symbol"],
+                        p.get(
+                            "positionSide",
+                            "BOTH"
+                        )
+                    )
+
+                    position_states.pop(
+                        position_key(p),
+                        None
+                    )
+
+            except Exception:
+
+                log.exception(
+                    "PORTFOLIO CLOSE FAILED | %s",
+                    p["symbol"]
+                )
+
     last_snapshot = {
         "last_run":
             time.time(),
@@ -1881,7 +1965,7 @@ def monitor_loop():
     )
 
     log.warning(
-        "MAQ BINANCE BOT V2 STARTED"
+        "MAQ BINANCE BOT V3 STARTED"
     )
 
     log.warning(
@@ -1891,10 +1975,19 @@ def monitor_loop():
     )
 
     log.warning(
-        "LOCKED RISK RULES | "
-        "SL=-20%% | BE=+10%% | "
-        "TP1=+20%% ROI / CLOSE 50%% | "
-        "FINAL=+60%%"
+        "RAILWAY RISK VARIABLES | "
+        "SL=-%.2f%% | "
+        "BE=+%.2f%% | "
+        "TP1=+%.2f%% | "
+        "TP1 CLOSE=%.2f%% | "
+        "FINAL=+%.2f%% | "
+        "PORTFOLIO=$%.2f",
+        INITIAL_STOP_LOSS_ROI_PCT,
+        BREAKEVEN_TRIGGER_ROI_PCT,
+        PARTIAL_TP_ROI_PCT,
+        PARTIAL_CLOSE_PCT,
+        FINAL_TP_ROI_PCT,
+        PORTFOLIO_PROFIT_USD
     )
 
     log.warning(
@@ -1937,14 +2030,28 @@ def health():
     return jsonify(
         {
             "status": "ok",
-            "service": "MAQ Binance Bot V2",
+            "service": "MAQ Binance Bot V3",
             "webhook": "async",
+            "risk_source": "Railway environment variables",
+
             "risk_rules": {
-                "SL": -20,
-                "BE": 10,
-                "TP1": 20,
-                "TP1_close_pct": 50,
-                "FINAL": 60
+                "SL":
+                    -INITIAL_STOP_LOSS_ROI_PCT,
+
+                "BE":
+                    BREAKEVEN_TRIGGER_ROI_PCT,
+
+                "TP1":
+                    PARTIAL_TP_ROI_PCT,
+
+                "TP1_close_pct":
+                    PARTIAL_CLOSE_PCT,
+
+                "FINAL":
+                    FINAL_TP_ROI_PCT,
+
+                "PORTFOLIO_PROFIT_USD":
+                    PORTFOLIO_PROFIT_USD
             }
         }
     )
@@ -1960,7 +2067,7 @@ def status():
     return jsonify(
         {
             "version":
-                "MAQ-BINANCE-V2",
+                "MAQ-BINANCE-V3-RAILWAY-VARIABLES",
 
             "entry": {
                 "margin_usdt":
@@ -1976,22 +2083,25 @@ def status():
 
             "risk": {
                 "initial_stop_roi":
-                    -20,
+                    -INITIAL_STOP_LOSS_ROI_PCT,
 
                 "breakeven_roi":
-                    10,
+                    BREAKEVEN_TRIGGER_ROI_PCT,
 
                 "partial_tp_roi":
-                    20,
+                    PARTIAL_TP_ROI_PCT,
 
                 "partial_close_pct":
-                    50,
+                    PARTIAL_CLOSE_PCT,
 
                 "final_tp_roi":
-                    60,
+                    FINAL_TP_ROI_PCT,
 
-                "portfolio_exit":
-                    False
+                "portfolio_profit_usd":
+                    PORTFOLIO_PROFIT_USD,
+
+                "portfolio_exit_enabled":
+                    PORTFOLIO_PROFIT_USD > 0
             },
 
             "snapshot":
@@ -2096,12 +2206,6 @@ def tradingview_webhook():
             symbol,
             normalized
         )
-
-        # ====================================================
-        # BACKGROUND PROCESSING
-        #
-        # TradingView receives HTTP 200 immediately.
-        # ====================================================
 
         thread = threading.Thread(
             target=process_signal_background,
