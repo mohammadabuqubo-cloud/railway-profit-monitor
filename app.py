@@ -1,3 +1,4 @@
+
 import os
 import time
 import logging
@@ -34,6 +35,20 @@ def env_float(name, default):
     return float(default) if raw is None or str(raw).strip() == "" else float(raw)
 
 
+def required_env_float(name):
+    """Require explicit Railway configuration; never silently use a trading-risk default."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        raise RuntimeError(f"Missing required Railway variable: {name}")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Railway variable {name} must be numeric") from exc
+    if not 0 < value <= 100:
+        raise RuntimeError(f"Railway variable {name} must be greater than 0 and at most 100")
+    return value
+
+
 def env_int(name, default):
     raw = os.environ.get(name)
     return int(default) if raw is None or str(raw).strip() == "" else int(raw)
@@ -52,14 +67,13 @@ BINANCE_API_KEY = env_str("BINANCE_API_KEY")
 BINANCE_API_SECRET = env_str("BINANCE_API_SECRET")
 USE_TESTNET = env_str("BINANCE_TESTNET", "false").lower() == "true"
 
-# Never poll faster than 30 seconds. This prevents Binance -1003 errors.
 POLL_INTERVAL_SECONDS = max(30, env_int("POLL_INTERVAL_SECONDS", 30))
 
-INITIAL_STOP_LOSS_ROI_PCT = env_float("INITIAL_STOP_LOSS_ROI_PCT", 20)
-BREAKEVEN_TRIGGER_ROI_PCT = env_float("BREAKEVEN_TRIGGER_ROI_PCT", 10)
-PARTIAL_TP_ROI_PCT = env_float("PARTIAL_TP_ROI_PCT", 20)
-PARTIAL_CLOSE_PCT = env_float("PARTIAL_CLOSE_PCT", 50)
-FINAL_TP_ROI_PCT = env_float("FINAL_TP_ROI_PCT", 60)
+INITIAL_STOP_LOSS_ROI_PCT = required_env_float("INITIAL_STOP_LOSS_ROI_PCT")
+BREAKEVEN_TRIGGER_ROI_PCT = required_env_float("BREAKEVEN_TRIGGER_ROI_PCT")
+PARTIAL_TP_ROI_PCT = required_env_float("PARTIAL_TP_ROI_PCT")
+PARTIAL_CLOSE_PCT = required_env_float("PARTIAL_CLOSE_PCT")
+FINAL_TP_ROI_PCT = required_env_float("FINAL_TP_ROI_PCT")
 PORTFOLIO_PROFIT_USD = env_float("PORTFOLIO_PROFIT_USD", 0)
 
 ORDER_MARGIN_USDT = env_float("ORDER_MARGIN_USDT", 50)
@@ -703,7 +717,6 @@ def process_entry_signal(signal, raw_symbol):
 def check_positions():
     global last_snapshot
 
-    # Exactly one all-position request per monitor cycle.
     open_positions = get_open_positions()
     current_keys = {position_key(p) for p in open_positions}
 
@@ -785,7 +798,6 @@ def check_positions():
             PORTFOLIO_PROFIT_USD
         )
 
-        # Reuse the positions already fetched in this cycle.
         for p in open_positions:
             close_position(p)
             cancel_bot_stops(p["symbol"], p.get("positionSide", "BOTH"))
@@ -883,10 +895,6 @@ def status():
 
 # ============================================================
 # TRADINGVIEW MESSAGE PARSER
-# Supports existing BUY|SYMBOL, JSON, and original DH order fills.
-# The DH default text resembles:
-# DH: (Strategy) Super SmartSuper Trend (...): order buy @ 1000
-# filled on BINANCE:AIOTUSDT.P. New strategy position is 12345
 # ============================================================
 
 def parse_tradingview_message(raw):
@@ -894,19 +902,19 @@ def parse_tradingview_message(raw):
     if not raw:
         raise ValueError("Empty TradingView message")
 
-    # Old MAQ format, with optional trailing fields.
-    old = re.fullmatch(r"\s*(BUY|SELL)\s*\|\s*([A-Za-z0-9:._/\-]+)(?:\|[^\r\n]*)?\s*", raw, re.IGNORECASE)
+    old = re.fullmatch(
+        r"\s*(BUY|SELL)\s*\|\s*([A-Za-z0-9:._/\-]+)(?:\|[^\r\n]*)?\s*",
+        raw,
+        re.IGNORECASE
+    )
     if old:
         return old.group(1).upper(), normalize_symbol(old.group(2))
 
-    # Original TradingView DH strategy order-fill message.
-    # Require both 'order' and 'filled on' to avoid treating
-    # general strategy notifications as executable signals.
     dh = re.search(
         r"\border\s+(buy|sell)\s+@\s+[^\r\n]*?\bfilled\s+on\s+"
         r"([A-Za-z0-9:._/\-]+)",
         raw,
-        re.IGNORECASE,
+        re.IGNORECASE
     )
     if dh:
         return dh.group(1).upper(), normalize_symbol(dh.group(2).rstrip("."))
@@ -925,12 +933,14 @@ def parse_tradingview_request(req):
                 if signal not in ("BUY", "SELL"):
                     raise ValueError("JSON signal must be BUY or SELL")
                 return signal, normalize_symbol(symbol)
-            # Also accept JSON containing the original DH message.
+
             for field in ("message", "text", "alert"):
                 if isinstance(data.get(field), str):
                     return parse_tradingview_message(data[field])
+
         elif isinstance(data, str):
             return parse_tradingview_message(data)
+
     return parse_tradingview_message(req.get_data(as_text=True))
 
 
@@ -945,10 +955,14 @@ def tradingview_webhook():
     except ValueError as exc:
         log.warning("Rejected TradingView webhook: %s", exc)
         return jsonify({"status": "error", "error": str(exc)}), 400
+
     except Exception as exc:
         log.exception("TradingView webhook failed")
         status_code = 429 if is_binance_rate_limit_error(exc) else 500
-        return jsonify({"status": "error", "error": str(exc)}), status_code
+        return jsonify({
+            "status": "error",
+            "error": str(exc)
+        }), status_code
 
 
 # ============================================================
