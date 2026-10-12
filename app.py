@@ -1,112 +1,221 @@
 
 import os
+import re
+import json
 import time
-import logging
-import threading
 import hmac
 import hashlib
-import json
-import re
+import logging
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
-from decimal import Decimal, ROUND_DOWN
 
-from flask import Flask, jsonify, request
+from decimal import Decimal, ROUND_DOWN
+from flask import Flask, request, jsonify
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 
 
 # ============================================================
-# LOGGING / FLASK
+# MAQ BINANCE RAILWAY BOT - DH COMPATIBLE V3
+#
+# Supports:
+# - Original DH TradingView strategy messages
+# - BUY|BTCUSDT and SELL|BTCUSDT
+# - Automatic symbol normalization
+# - Binance Futures market orders
+# - Opposite-signal position reversal
+# - Variable-controlled initial stop loss
+# - Variable-controlled breakeven
+# - Variable-controlled partial take profit
+# - Variable-controlled final take profit
+# - Optional portfolio profit target
+#
+# EMPTY INITIAL_STOP_LOSS_ROI_PCT = DISABLED
+#
+# WARNING:
+# This bot can place leveraged Futures orders.
+# Test with Binance Testnet before live deployment.
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("binance-risk-manager")
+
+# ============================================================
+# LOGGING AND FLASK
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+log = logging.getLogger("MAQ-BINANCE-BOT")
+
 app = Flask(__name__)
 
 
 # ============================================================
-# ENV HELPERS
+# ENVIRONMENT HELPERS
 # ============================================================
-
-def env_float(name, default):
-    raw = os.environ.get(name)
-    return float(default) if raw is None or str(raw).strip() == "" else float(raw)
-
-
-def required_env_float(name):
-    """Require explicit Railway configuration; never silently use a trading-risk default."""
-    raw = os.environ.get(name)
-    if raw is None or not str(raw).strip():
-        raise RuntimeError(f"Missing required Railway variable: {name}")
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"Railway variable {name} must be numeric") from exc
-    if not 0 < value <= 100:
-        raise RuntimeError(f"Railway variable {name} must be greater than 0 and at most 100")
-    return value
-
-
-def env_int(name, default):
-    raw = os.environ.get(name)
-    return int(default) if raw is None or str(raw).strip() == "" else int(raw)
-
 
 def env_str(name, default=""):
-    raw = os.environ.get(name)
-    return default if raw is None else str(raw).strip()
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return str(value).strip()
+
+
+def env_float(name, default=0.0):
+    value = env_str(name)
+
+    if value == "":
+        return float(default)
+
+    return float(value)
+
+
+def env_int(name, default=0):
+    value = env_str(name)
+
+    if value == "":
+        return int(default)
+
+    return int(value)
+
+
+def optional_percentage(name):
+    """
+    Empty or zero means disabled.
+    Positive values are percentages.
+    """
+    value = env_str(name)
+
+    if value == "":
+        return 0.0
+
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{name} must be a number or empty"
+        ) from exc
+
+    if result < 0 or result > 100:
+        raise RuntimeError(
+            f"{name} must be between 0 and 100"
+        )
+
+    return result
 
 
 # ============================================================
-# CONFIG
+# RAILWAY VARIABLES
 # ============================================================
 
 BINANCE_API_KEY = env_str("BINANCE_API_KEY")
 BINANCE_API_SECRET = env_str("BINANCE_API_SECRET")
-USE_TESTNET = env_str("BINANCE_TESTNET", "false").lower() == "true"
 
-POLL_INTERVAL_SECONDS = max(30, env_int("POLL_INTERVAL_SECONDS", 30))
-
-INITIAL_STOP_LOSS_ROI_PCT = required_env_float("INITIAL_STOP_LOSS_ROI_PCT")
-BREAKEVEN_TRIGGER_ROI_PCT = required_env_float("BREAKEVEN_TRIGGER_ROI_PCT")
-PARTIAL_TP_ROI_PCT = required_env_float("PARTIAL_TP_ROI_PCT")
-PARTIAL_CLOSE_PCT = required_env_float("PARTIAL_CLOSE_PCT")
-FINAL_TP_ROI_PCT = required_env_float("FINAL_TP_ROI_PCT")
-PORTFOLIO_PROFIT_USD = env_float("PORTFOLIO_PROFIT_USD", 0)
-
-ORDER_MARGIN_USDT = env_float("ORDER_MARGIN_USDT", 50)
-ENTRY_LEVERAGE = env_int("ENTRY_LEVERAGE", 16)
-
-EXCHANGE_INFO_CACHE_SECONDS = max(
-    3600,
-    env_int("EXCHANGE_INFO_CACHE_SECONDS", 21600)
+BINANCE_TESTNET = (
+    env_str("BINANCE_TESTNET", "false").lower()
+    == "true"
 )
+
+ORDER_MARGIN_USDT = env_float(
+    "ORDER_MARGIN_USDT", 50
+)
+
+ENTRY_LEVERAGE = env_int(
+    "ENTRY_LEVERAGE", 16
+)
+
+POLL_INTERVAL_SECONDS = max(
+    5,
+    env_int("POLL_INTERVAL_SECONDS", 5)
+)
+
+# Empty means disabled.
+INITIAL_STOP_LOSS_ROI_PCT = optional_percentage(
+    "INITIAL_STOP_LOSS_ROI_PCT"
+)
+
+BREAKEVEN_TRIGGER_ROI_PCT = optional_percentage(
+    "BREAKEVEN_TRIGGER_ROI_PCT"
+)
+
+PARTIAL_TP_ROI_PCT = optional_percentage(
+    "PARTIAL_TP_ROI_PCT"
+)
+
+PARTIAL_CLOSE_PCT = optional_percentage(
+    "PARTIAL_CLOSE_PCT"
+)
+
+FINAL_TP_ROI_PCT = optional_percentage(
+    "FINAL_TP_ROI_PCT"
+)
+
+PORTFOLIO_PROFIT_USD = env_float(
+    "PORTFOLIO_PROFIT_USD", 0
+)
+
+WEBHOOK_SECRET = env_str("WEBHOOK_SECRET")
+
+# Default to disabled until explicitly enabled.
+ENABLE_LIVE_ORDERS = (
+    env_str("ENABLE_LIVE_ORDERS", "false").lower()
+    == "true"
+)
+
+
+# ============================================================
+# CONFIG VALIDATION
+# ============================================================
+
+if ORDER_MARGIN_USDT <= 0:
+    raise RuntimeError(
+        "ORDER_MARGIN_USDT must be positive"
+    )
+
+if ENTRY_LEVERAGE < 1 or ENTRY_LEVERAGE > 125:
+    raise RuntimeError(
+        "ENTRY_LEVERAGE must be between 1 and 125"
+    )
+
+if (
+    PARTIAL_TP_ROI_PCT > 0
+    and PARTIAL_CLOSE_PCT <= 0
+):
+    raise RuntimeError(
+        "PARTIAL_CLOSE_PCT must be positive when partial TP is enabled"
+    )
+
+if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+    log.warning(
+        "Binance API credentials are missing"
+    )
 
 
 # ============================================================
 # BINANCE CLIENT
 # ============================================================
 
-if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-    log.warning("BINANCE_API_KEY or BINANCE_API_SECRET is missing")
-
 client = Client(
     BINANCE_API_KEY,
     BINANCE_API_SECRET,
-    testnet=USE_TESTNET
+    testnet=BINANCE_TESTNET
 )
 
 BINANCE_FUTURES_BASE = (
     "https://testnet.binancefuture.com"
-    if USE_TESTNET
+    if BINANCE_TESTNET
     else "https://fapi.binance.com"
 )
 
 
 # ============================================================
-# RUNTIME STATE
+# GLOBAL STATE
 # ============================================================
 
 position_states = {}
@@ -118,51 +227,288 @@ last_snapshot = {
     "total_unrealized_profit": 0.0
 }
 
-BOT_ALGO_PREFIX = "MAQSL"
-
-entry_lock = threading.Lock()
-monitor_start_lock = threading.Lock()
-exchange_info_lock = threading.Lock()
-
-monitor_started = False
-
 exchange_info_cache = {
     "loaded_at": 0.0,
     "symbols": {}
 }
 
+BOT_ALGO_PREFIX = "MAQSL"
+
+entry_lock = threading.Lock()
+monitor_lock = threading.Lock()
+exchange_info_lock = threading.Lock()
+
+monitor_started = False
+
 
 # ============================================================
-# RATE-LIMIT HELPERS
+# UTILITIES
 # ============================================================
 
-def is_binance_rate_limit_error(exc):
+def is_rate_limit_error(exc):
     message = str(exc).lower()
+
     return (
         "-1003" in message
         or "too many requests" in message
-        or "request limit" in message
         or "rate limit" in message
     )
 
 
+def normalize_symbol(raw_symbol):
+    symbol = str(raw_symbol).strip().upper()
+
+    if ":" in symbol:
+        symbol = symbol.split(":")[-1]
+
+    if symbol.endswith(".P"):
+        symbol = symbol[:-2]
+
+    symbol = (
+        symbol.replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+    )
+
+    if not re.fullmatch(r"[A-Z0-9]{5,30}", symbol):
+        raise ValueError(
+            f"Invalid Futures symbol: {symbol}"
+        )
+
+    return symbol
+
+
+def position_key(position):
+    return (
+        position["symbol"]
+        + ":"
+        + position.get("positionSide", "BOTH")
+    )
+
+
+def round_down_to_step(value, step):
+    value = Decimal(str(value))
+    step = Decimal(str(step))
+
+    return float(
+        (value / step).to_integral_value(
+            rounding=ROUND_DOWN
+        ) * step
+    )
+
+
 # ============================================================
-# SIGNED BINANCE ALGO REQUEST
+# BINANCE EXCHANGE INFORMATION
+# ============================================================
+
+def refresh_exchange_info():
+    now = time.time()
+
+    if (
+        exchange_info_cache["symbols"]
+        and now - exchange_info_cache["loaded_at"] < 21600
+    ):
+        return
+
+    with exchange_info_lock:
+
+        now = time.time()
+
+        if (
+            exchange_info_cache["symbols"]
+            and now - exchange_info_cache["loaded_at"] < 21600
+        ):
+            return
+
+        response = client.futures_exchange_info()
+
+        exchange_info_cache["symbols"] = {
+            item["symbol"]: item
+            for item in response["symbols"]
+        }
+
+        exchange_info_cache["loaded_at"] = now
+
+
+def get_symbol_info(symbol):
+    refresh_exchange_info()
+
+    return exchange_info_cache["symbols"].get(
+        symbol
+    )
+
+
+def validate_symbol(symbol):
+    info = get_symbol_info(symbol)
+
+    if info is None:
+        raise ValueError(
+            f"Unknown Binance Futures symbol: {symbol}"
+        )
+
+    if info.get("status") != "TRADING":
+        raise ValueError(
+            f"Symbol is not trading: {symbol}"
+        )
+
+    return info
+
+
+def get_filter(symbol, filter_type):
+    info = validate_symbol(symbol)
+
+    for item in info.get("filters", []):
+        if item.get("filterType") == filter_type:
+            return item
+
+    raise ValueError(
+        f"Missing {filter_type} for {symbol}"
+    )
+
+
+def get_quantity_step(symbol):
+    filt = get_filter(symbol, "LOT_SIZE")
+
+    return float(filt["stepSize"])
+
+
+def get_market_quantity_step(symbol):
+    info = validate_symbol(symbol)
+
+    for item in info.get("filters", []):
+        if item.get("filterType") == "MARKET_LOT_SIZE":
+            step = float(item.get("stepSize", 0))
+            if step > 0:
+                return step
+
+    return get_quantity_step(symbol)
+
+
+def get_tick_size(symbol):
+    filt = get_filter(symbol, "PRICE_FILTER")
+
+    return float(filt["tickSize"])
+
+
+def round_quantity(symbol, quantity):
+    return round_down_to_step(
+        quantity,
+        get_market_quantity_step(symbol)
+    )
+
+
+def round_price(symbol, price):
+    tick = Decimal(str(get_tick_size(symbol)))
+    value = Decimal(str(price))
+
+    result = (
+        (value / tick).to_integral_value(
+            rounding=ROUND_DOWN
+        ) * tick
+    )
+
+    return format(result, "f")
+
+
+# ============================================================
+# BINANCE POSITIONS
+# ============================================================
+
+def get_open_positions():
+    positions = client.futures_position_information()
+
+    return [
+        p for p in positions
+        if abs(float(p["positionAmt"])) > 0
+    ]
+
+
+def get_symbol_positions(symbol):
+    return client.futures_position_information(
+        symbol=symbol
+    )
+
+
+def get_current_position(symbol):
+    positions = [
+        p for p in get_symbol_positions(symbol)
+        if abs(float(p["positionAmt"])) > 0
+    ]
+
+    if len(positions) > 1:
+        raise RuntimeError(
+            f"Multiple open position sides for {symbol}; "
+            "Hedge Mode requires separate handling"
+        )
+
+    return positions[0] if positions else None
+
+
+def position_margin(position):
+    margin = float(
+        position.get("positionInitialMargin", 0)
+        or 0
+    )
+
+    if margin > 0:
+        return margin
+
+    notional = abs(
+        float(position.get("notional", 0) or 0)
+    )
+
+    leverage = float(
+        position.get("leverage", 1) or 1
+    )
+
+    return notional / max(leverage, 1)
+
+
+def calculate_roi(position):
+    margin = position_margin(position)
+
+    if margin <= 0:
+        return 0.0
+
+    profit = float(
+        position.get(
+            "unRealizedProfit",
+            position.get("unrealizedProfit", 0)
+        ) or 0
+    )
+
+    return profit / margin * 100
+
+
+# ============================================================
+# BINANCE CONDITIONAL ALGO API
 # ============================================================
 
 def binance_algo_request(method, path, params=None):
+
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        raise RuntimeError(
+            "Missing Binance credentials"
+        )
+
     params = dict(params or {})
-    params["timestamp"] = int(time.time() * 1000)
+
+    params["timestamp"] = int(
+        time.time() * 1000
+    )
+
     params["recvWindow"] = 5000
 
     query = urllib.parse.urlencode(params)
+
     signature = hmac.new(
-        BINANCE_API_SECRET.encode("utf-8"),
-        query.encode("utf-8"),
+        BINANCE_API_SECRET.encode(),
+        query.encode(),
         hashlib.sha256
     ).hexdigest()
 
-    signed_query = query + "&signature=" + signature
+    payload = query + "&signature=" + signature
+
     headers = {
         "X-MBX-APIKEY": BINANCE_API_KEY,
         "Content-Type": "application/x-www-form-urlencoded"
@@ -171,201 +517,305 @@ def binance_algo_request(method, path, params=None):
     method = method.upper()
 
     if method == "POST":
-        url = BINANCE_FUTURES_BASE + path
+
         req = urllib.request.Request(
-            url,
-            data=signed_query.encode("utf-8"),
+            BINANCE_FUTURES_BASE + path,
+            data=payload.encode(),
             headers=headers,
             method="POST"
         )
+
     else:
-        url = BINANCE_FUTURES_BASE + path + "?" + signed_query
-        req = urllib.request.Request(url, headers=headers, method=method)
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            text = response.read().decode("utf-8")
-            return json.loads(text) if text else {}
-
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Binance Algo HTTP {exc.code}: {body}") from exc
-
-    except Exception as exc:
-        raise RuntimeError(f"Binance Algo request failed: {exc}") from exc
-
-
-# ============================================================
-# POSITION HELPERS
-# ============================================================
-
-def position_key(p):
-    return f"{p['symbol']}:{p.get('positionSide', 'BOTH')}"
-
-
-def get_open_positions():
-    positions = client.futures_position_information()
-    return [p for p in positions if abs(float(p["positionAmt"])) > 0]
-
-
-def get_symbol_positions(symbol):
-    return client.futures_position_information(symbol=symbol)
-
-
-def get_current_position(symbol, position_side="BOTH"):
-    for p in get_symbol_positions(symbol):
-        if (
-            p["symbol"] == symbol
-            and p.get("positionSide", "BOTH") == position_side
-            and abs(float(p["positionAmt"])) > 0
-        ):
-            return p
-    return None
-
-
-def get_any_symbol_position(symbol):
-    for p in get_symbol_positions(symbol):
-        if abs(float(p["positionAmt"])) > 0:
-            return p
-    return None
-
-
-def position_margin(p):
-    try:
-        value = float(p.get("positionInitialMargin", 0) or 0)
-        if value > 0:
-            return value
-    except Exception:
-        pass
-
-    try:
-        isolated = float(p.get("isolatedMargin", 0) or 0)
-        if isolated > 0:
-            return isolated
-    except Exception:
-        pass
-
-    try:
-        notional = abs(float(p.get("notional", 0) or 0))
-        leverage = float(p.get("leverage", 1) or 1)
-        if leverage > 0:
-            return notional / leverage
-    except Exception:
-        pass
-
-    return 0.0
-
-
-def calculate_roi_pct(p):
-    margin = position_margin(p)
-    if margin <= 0:
-        return 0.0
-
-    unrealized = float(
-        p.get("unRealizedProfit", 0)
-        or p.get("unrealizedProfit", 0)
-        or 0
-    )
-    return (unrealized / margin) * 100.0
-
-
-# ============================================================
-# CACHED EXCHANGE INFORMATION
-# ============================================================
-
-def refresh_exchange_info_cache(force=False):
-    now = time.time()
-    age = now - exchange_info_cache["loaded_at"]
-
-    if (
-        not force
-        and exchange_info_cache["symbols"]
-        and age < EXCHANGE_INFO_CACHE_SECONDS
-    ):
-        return
-
-    with exchange_info_lock:
-        now = time.time()
-        age = now - exchange_info_cache["loaded_at"]
-
-        if (
-            not force
-            and exchange_info_cache["symbols"]
-            and age < EXCHANGE_INFO_CACHE_SECONDS
-        ):
-            return
-
-        exchange_info = client.futures_exchange_info()
-        exchange_info_cache["symbols"] = {
-            item["symbol"]: item
-            for item in exchange_info.get("symbols", [])
-        }
-        exchange_info_cache["loaded_at"] = now
-
-        log.info(
-            "Exchange information cached: %s symbols",
-            len(exchange_info_cache["symbols"])
+        req = urllib.request.Request(
+            BINANCE_FUTURES_BASE
+            + path
+            + "?"
+            + payload,
+            headers=headers,
+            method=method
         )
 
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=15
+        ) as response:
 
-def get_symbol_info(symbol):
-    refresh_exchange_info_cache()
-    return exchange_info_cache["symbols"].get(symbol)
+            body = response.read().decode()
 
+            return json.loads(body) if body else {}
 
-def get_quantity_step_size(symbol):
-    info = get_symbol_info(symbol)
-    if info:
-        for item_filter in info["filters"]:
-            if item_filter["filterType"] == "LOT_SIZE":
-                return Decimal(str(item_filter["stepSize"]))
-    return Decimal("0.001")
+    except urllib.error.HTTPError as exc:
 
+        body = exc.read().decode(
+            errors="replace"
+        )
 
-def get_tick_size(symbol):
-    info = get_symbol_info(symbol)
-    if info:
-        for item_filter in info["filters"]:
-            if item_filter["filterType"] == "PRICE_FILTER":
-                return Decimal(str(item_filter["tickSize"]))
-    return Decimal("0.00000001")
+        raise RuntimeError(
+            f"Binance Algo API {exc.code}: {body}"
+        ) from exc
 
 
-def round_quantity_down(symbol, qty):
-    step = get_quantity_step_size(symbol)
-    value = Decimal(str(abs(qty)))
-    rounded = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
-    return float(rounded)
+def get_open_algo_orders(symbol):
+    response = binance_algo_request(
+        "GET",
+        "/fapi/v1/openAlgoOrders",
+        {
+            "symbol": symbol,
+            "algoType": "CONDITIONAL"
+        }
+    )
+
+    return (
+        response
+        if isinstance(response, list)
+        else []
+    )
 
 
-def round_price(symbol, price):
-    tick = get_tick_size(symbol)
-    value = Decimal(str(price))
-    rounded = (value / tick).to_integral_value(rounding=ROUND_DOWN) * tick
-    return format(rounded, "f")
+def cancel_bot_stops(symbol, position_side="BOTH"):
+
+    for order in get_open_algo_orders(symbol):
+
+        client_id = str(
+            order.get("clientAlgoId", "")
+        )
+
+        if not client_id.startswith(BOT_ALGO_PREFIX):
+            continue
+
+        order_side = order.get(
+            "positionSide", "BOTH"
+        )
+
+        if (
+            position_side != "BOTH"
+            and order_side != position_side
+        ):
+            continue
+
+        algo_id = order.get("algoId")
+
+        if algo_id:
+            binance_algo_request(
+                "DELETE",
+                "/fapi/v1/algoOrder",
+                {
+                    "symbol": symbol,
+                    "algoId": algo_id
+                }
+            )
+
+            log.info(
+                "Cancelled MAQ stop: %s %s",
+                symbol,
+                algo_id
+            )
+
+
+def create_protective_stop(position, price, reason):
+
+    amount = float(position["positionAmt"])
+
+    if amount == 0:
+        return False
+
+    symbol = position["symbol"]
+
+    side = (
+        "SELL"
+        if amount > 0
+        else "BUY"
+    )
+
+    position_side = position.get(
+        "positionSide", "BOTH"
+    )
+
+    trigger_price = round_price(
+        symbol, price
+    )
+
+    client_id = (
+        f"{BOT_ALGO_PREFIX}"
+        f"_{reason[:3]}"
+        f"_{int(time.time() * 1000)}"
+    )
+
+    params = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol,
+        "side": side,
+        "type": "STOP_MARKET",
+        "triggerPrice": trigger_price,
+        "workingType": "MARK_PRICE",
+        "closePosition": "true",
+        "clientAlgoId": client_id
+    }
+
+    if position_side != "BOTH":
+        params["positionSide"] = position_side
+
+    # Place the replacement first, so an existing
+    # protective stop is not removed before the
+    # new order has been accepted.
+    response = binance_algo_request(
+        "POST",
+        "/fapi/v1/algoOrder",
+        params
+    )
+
+    # Cancel older MAQ stops, preserving the new one.
+    try:
+        for order in get_open_algo_orders(symbol):
+
+            old_id = str(
+                order.get("clientAlgoId", "")
+            )
+
+            if (
+                old_id.startswith(BOT_ALGO_PREFIX)
+                and old_id != client_id
+                and (
+                    position_side == "BOTH"
+                    or order.get("positionSide", "BOTH")
+                    == position_side
+                )
+            ):
+                binance_algo_request(
+                    "DELETE",
+                    "/fapi/v1/algoOrder",
+                    {
+                        "symbol": symbol,
+                        "algoId": order["algoId"]
+                    }
+                )
+
+    except Exception:
+        log.exception(
+            "Old stop cleanup failed for %s",
+            symbol
+        )
+
+    log.info(
+        "%s stop created for %s at %s",
+        reason,
+        symbol,
+        trigger_price
+    )
+
+    return response
+
+
+# ============================================================
+# INITIAL STOP LOSS
+# ============================================================
+
+def calculate_initial_stop_price(position):
+
+    if INITIAL_STOP_LOSS_ROI_PCT <= 0:
+        return None
+
+    entry = float(position["entryPrice"])
+
+    leverage = float(
+        position.get("leverage", 1) or 1
+    )
+
+    amount = float(position["positionAmt"])
+
+    fraction = (
+        INITIAL_STOP_LOSS_ROI_PCT
+        / 100
+        / max(leverage, 1)
+    )
+
+    if amount > 0:
+        return entry * (1 - fraction)
+
+    return entry * (1 + fraction)
+
+
+def arm_initial_stop(position):
+
+    # Empty Railway variable means disabled.
+    if INITIAL_STOP_LOSS_ROI_PCT <= 0:
+        return False
+
+    price = calculate_initial_stop_price(
+        position
+    )
+
+    if price is None:
+        return False
+
+    return bool(
+        create_protective_stop(
+            position,
+            price,
+            "INITIAL"
+        )
+    )
+
+
+# ============================================================
+# BREAKEVEN
+# ============================================================
+
+def move_stop_to_breakeven(position):
+
+    if BREAKEVEN_TRIGGER_ROI_PCT <= 0:
+        return False
+
+    entry = float(position["entryPrice"])
+
+    if entry <= 0:
+        return False
+
+    return bool(
+        create_protective_stop(
+            position,
+            entry,
+            "BREAKEVEN"
+        )
+    )
 
 
 # ============================================================
 # MARKET CLOSE
 # ============================================================
 
-def close_position_quantity(p, quantity):
-    symbol = p["symbol"]
-    position_amt = float(p["positionAmt"])
+def close_position_quantity(position, quantity):
 
-    if position_amt == 0:
-        return False
+    amount = float(position["positionAmt"])
 
-    quantity = round_quantity_down(symbol, quantity)
+    if amount == 0:
+        return None
+
+    symbol = position["symbol"]
+
+    quantity = round_quantity(
+        symbol,
+        min(abs(amount), abs(quantity))
+    )
+
     if quantity <= 0:
-        return False
+        return None
 
-    close_side = SIDE_SELL if position_amt > 0 else SIDE_BUY
-    position_side = p.get("positionSide", "BOTH")
+    side = (
+        SIDE_SELL
+        if amount > 0
+        else SIDE_BUY
+    )
+
+    position_side = position.get(
+        "positionSide", "BOTH"
+    )
 
     params = {
         "symbol": symbol,
-        "side": close_side,
+        "side": side,
         "type": ORDER_TYPE_MARKET,
         "quantity": quantity
     }
@@ -375,604 +825,826 @@ def close_position_quantity(p, quantity):
     else:
         params["positionSide"] = position_side
 
-    try:
-        result = client.futures_create_order(**params)
-        log.info("Market close %s qty=%s", symbol, quantity)
-        return result
-    except Exception as exc:
-        last_errors[position_key(p)] = str(exc)
-        log.exception("Failed market close %s", symbol)
-        return False
+    result = client.futures_create_order(
+        **params
+    )
+
+    log.warning(
+        "Closed %s quantity %s",
+        symbol,
+        quantity
+    )
+
+    return result
 
 
-def close_position(p):
-    return close_position_quantity(p, abs(float(p["positionAmt"])))
+def close_position(position):
+    return close_position_quantity(
+        position,
+        abs(float(position["positionAmt"]))
+    )
 
 
 # ============================================================
-# ALGO STOP MANAGEMENT
+# PARTIAL TAKE PROFIT
 # ============================================================
 
-def get_open_algo_orders(symbol):
-    result = binance_algo_request(
-        "GET",
-        "/fapi/v1/openAlgoOrders",
-        {"symbol": symbol, "algoType": "CONDITIONAL"}
-    )
-    return result if isinstance(result, list) else []
+def execute_partial_take_profit(position):
 
-
-def cancel_algo_order(symbol, algo_id):
-    return binance_algo_request(
-        "DELETE",
-        "/fapi/v1/algoOrder",
-        {"symbol": symbol, "algoId": algo_id}
-    )
-
-
-def cancel_bot_stops(symbol, position_side="BOTH"):
-    try:
-        for order in get_open_algo_orders(symbol):
-            client_id = str(order.get("clientAlgoId", ""))
-            if not client_id.startswith(BOT_ALGO_PREFIX):
-                continue
-
-            algo_position_side = order.get("positionSide", "BOTH")
-            if position_side != "BOTH" and algo_position_side != position_side:
-                continue
-
-            algo_id = order.get("algoId")
-            if algo_id:
-                cancel_algo_order(symbol, algo_id)
-                log.info("Cancelled bot stop %s algoId=%s", symbol, algo_id)
-        return True
-
-    except Exception as exc:
-        last_errors[f"{symbol}:{position_side}"] = str(exc)
-        log.exception("Failed cancelling Algo stop %s", symbol)
+    if (
+        PARTIAL_TP_ROI_PCT <= 0
+        or PARTIAL_CLOSE_PCT <= 0
+    ):
         return False
 
-
-def create_protective_stop(p, stop_price, reason):
-    symbol = p["symbol"]
-    position_amt = float(p["positionAmt"])
-
-    if position_amt == 0:
-        return False
-
-    position_side = p.get("positionSide", "BOTH")
-    close_side = "SELL" if position_amt > 0 else "BUY"
-    stop_price = round_price(symbol, stop_price)
-
-    cancel_bot_stops(symbol, position_side)
-
-    client_algo_id = (
-        f"{BOT_ALGO_PREFIX}_{reason[:4]}_{int(time.time())}"
+    quantity = (
+        abs(float(position["positionAmt"]))
+        * PARTIAL_CLOSE_PCT
+        / 100
     )
 
-    params = {
-        "algoType": "CONDITIONAL",
-        "symbol": symbol,
-        "side": close_side,
-        "type": "STOP_MARKET",
-        "triggerPrice": stop_price,
-        "workingType": "MARK_PRICE",
-        "closePosition": "true",
-        "clientAlgoId": client_algo_id
-    }
-
-    if position_side != "BOTH":
-        params["positionSide"] = position_side
-
-    try:
-        response = binance_algo_request("POST", "/fapi/v1/algoOrder", params)
-        last_errors.pop(position_key(p), None)
-        log.info("%s stop armed %s at %s", reason, symbol, stop_price)
-        return response
-    except Exception as exc:
-        last_errors[position_key(p)] = str(exc)
-        log.exception("Failed creating protective stop %s", symbol)
-        return False
-
-
-# ============================================================
-# RISK RULES
-# ============================================================
-
-def calculate_initial_stop_price(p):
-    entry = float(p["entryPrice"])
-    leverage = float(p.get("leverage", 1) or 1)
-    position_amt = float(p["positionAmt"])
-
-    if leverage <= 0:
-        leverage = 1
-
-    adverse_fraction = INITIAL_STOP_LOSS_ROI_PCT / 100.0 / leverage
-    return (
-        entry * (1 - adverse_fraction)
-        if position_amt > 0
-        else entry * (1 + adverse_fraction)
+    result = close_position_quantity(
+        position,
+        quantity
     )
 
-
-def arm_initial_stop_loss(p):
-    return create_protective_stop(
-        p,
-        calculate_initial_stop_price(p),
-        "INITIAL"
-    )
-
-
-def get_breakeven_price(p):
-    entry_price = float(p.get("entryPrice", 0) or 0)
-    if entry_price <= 0:
-        raise ValueError(f"Invalid entryPrice for {p.get('symbol', 'UNKNOWN')}")
-    return entry_price
-
-
-def move_stop_to_breakeven(p):
-    return create_protective_stop(p, get_breakeven_price(p), "BREAKEVEN")
-
-
-def execute_partial_take_profit(p):
-    current_qty = abs(float(p["positionAmt"]))
-    qty_to_close = current_qty * PARTIAL_CLOSE_PCT / 100.0
-    result = close_position_quantity(p, qty_to_close)
-
-    if result:
-        log.info("%s partial TP %.2f%%", p["symbol"], PARTIAL_CLOSE_PCT)
-        return True
-    return False
+    return bool(result)
 
 
 # ============================================================
 # POSITION STATE
 # ============================================================
 
-def get_or_create_state(p):
-    key = position_key(p)
+def get_position_state(position):
+
+    key = position_key(position)
+
     state = position_states.get(key)
 
-    if state is None:
+    entry = float(position["entryPrice"])
+
+    if (
+        state is None
+        or abs(state["entry_price"] - entry) > 1e-10
+    ):
+
         state = {
-            "entry_price": float(p["entryPrice"]),
+            "entry_price": entry,
             "initial_stop_armed": False,
             "breakeven_armed": False,
             "partial_tp_done": False
         }
+
         position_states[key] = state
 
     return state
 
 
 # ============================================================
-# TRADINGVIEW ENTRY HELPERS
+# ENTRY ORDER
 # ============================================================
 
-def normalize_symbol(raw_symbol):
-    symbol = str(raw_symbol).upper().strip()
-
-    if ":" in symbol:
-        symbol = symbol.split(":")[-1]
-
-    if symbol.endswith(".P"):
-        symbol = symbol[:-2]
-
-    return (
-        symbol.replace("/", "")
-        .replace("-", "")
-        .replace("_", "")
-    )
-
-
-def validate_futures_symbol(symbol):
-    info = get_symbol_info(symbol)
-    if info is None:
-        raise ValueError(f"{symbol} is not a Binance Futures symbol")
-
-    status = str(info.get("status", "")).upper()
-    if status and status != "TRADING":
-        raise ValueError(f"{symbol} is not currently trading")
-    return info
-
-
 def get_futures_price(symbol):
-    ticker = client.futures_symbol_ticker(symbol=symbol)
-    return float(ticker["price"])
 
-
-def set_symbol_leverage(symbol):
-    result = client.futures_change_leverage(
-        symbol=symbol,
-        leverage=ENTRY_LEVERAGE
+    response = client.futures_symbol_ticker(
+        symbol=symbol
     )
-    log.info("%s leverage set to %sx", symbol, ENTRY_LEVERAGE)
-    return result
+
+    return float(response["price"])
 
 
 def calculate_entry_quantity(symbol):
-    price = get_futures_price(symbol)
-    if price <= 0:
-        raise ValueError(f"Invalid market price for {symbol}")
 
-    notional = ORDER_MARGIN_USDT * ENTRY_LEVERAGE
-    raw_quantity = notional / price
-    quantity = round_quantity_down(symbol, raw_quantity)
+    price = get_futures_price(symbol)
+
+    notional = (
+        ORDER_MARGIN_USDT
+        * ENTRY_LEVERAGE
+    )
+
+    quantity = round_quantity(
+        symbol,
+        notional / price
+    )
 
     if quantity <= 0:
-        raise ValueError(f"Calculated quantity for {symbol} is zero")
+        raise RuntimeError(
+            f"Invalid quantity for {symbol}"
+        )
 
-    return quantity, price, notional
-
-
-def open_market_position(symbol, signal):
-    quantity, price, notional = calculate_entry_quantity(symbol)
-    side = SIDE_BUY if signal == "BUY" else SIDE_SELL
-
-    order = client.futures_create_order(
-        symbol=symbol,
-        side=side,
-        type=ORDER_TYPE_MARKET,
-        quantity=quantity
-    )
-
-    log.warning(
-        "ENTRY %s %s qty=%s price≈%s margin=%s leverage=%sx notional≈%s",
-        signal,
-        symbol,
-        quantity,
-        price,
-        ORDER_MARGIN_USDT,
-        ENTRY_LEVERAGE,
-        notional
-    )
-    return order
+    return quantity
 
 
-def wait_until_position_closed(symbol, timeout_seconds=10):
-    started = time.time()
+def wait_for_position(symbol, timeout=10):
 
-    while time.time() - started < timeout_seconds:
-        if get_any_symbol_position(symbol) is None:
+    start = time.time()
+
+    while time.time() - start < timeout:
+
+        position = get_current_position(symbol)
+
+        if position:
+            return position
+
+        time.sleep(0.5)
+
+    return None
+
+
+def wait_for_close(symbol, timeout=10):
+
+    start = time.time()
+
+    while time.time() - start < timeout:
+
+        if get_current_position(symbol) is None:
             return True
-        time.sleep(0.75)
+
+        time.sleep(0.5)
 
     return False
 
 
 def process_entry_signal(signal, raw_symbol):
-    signal = str(signal).upper().strip()
+
+    signal = signal.upper().strip()
     symbol = normalize_symbol(raw_symbol)
 
     if signal not in ("BUY", "SELL"):
-        raise ValueError("Signal must be BUY or SELL")
+        raise ValueError(
+            "Signal must be BUY or SELL"
+        )
 
-    validate_futures_symbol(symbol)
+    validate_symbol(symbol)
+
+    if not ENABLE_LIVE_ORDERS:
+        log.warning(
+            "DRY RUN: %s %s",
+            signal,
+            symbol
+        )
+
+        return {
+            "status": "dry_run",
+            "signal": signal,
+            "symbol": symbol
+        }
 
     with entry_lock:
-        current = get_any_symbol_position(symbol)
+
+        current = get_current_position(symbol)
 
         if current:
-            amount = float(current["positionAmt"])
-            current_direction = "BUY" if amount > 0 else "SELL"
 
-            if current_direction == signal:
-                log.info("%s %s ignored - already in same direction", signal, symbol)
+            amount = float(
+                current["positionAmt"]
+            )
+
+            current_signal = (
+                "BUY"
+                if amount > 0
+                else "SELL"
+            )
+
+            if current_signal == signal:
+
                 return {
                     "status": "ignored",
-                    "reason": "same_direction_position_exists",
-                    "signal": signal,
-                    "symbol": symbol
+                    "reason": "already_in_position",
+                    "symbol": symbol,
+                    "signal": signal
                 }
 
             log.warning(
-                "%s opposite signal received for %s; closing current %s position",
-                signal,
+                "Reversing %s from %s to %s",
                 symbol,
-                current_direction
+                current_signal,
+                signal
             )
+
+            # Close first; do not open the new position
+            # until the old one is confirmed closed.
+            close_position(current)
+
+            if not wait_for_close(symbol):
+                raise RuntimeError(
+                    f"Position failed to close: {symbol}"
+                )
 
             cancel_bot_stops(
                 symbol,
                 current.get("positionSide", "BOTH")
             )
 
-            if not close_position(current):
-                raise RuntimeError(f"Could not close existing {symbol} position")
+            position_states.pop(
+                position_key(current),
+                None
+            )
 
-            if not wait_until_position_closed(symbol):
-                raise RuntimeError(f"{symbol} position did not close in time")
+        client.futures_change_leverage(
+            symbol=symbol,
+            leverage=ENTRY_LEVERAGE
+        )
 
-            position_states.pop(position_key(current), None)
+        quantity = calculate_entry_quantity(
+            symbol
+        )
 
-        set_symbol_leverage(symbol)
-        order = open_market_position(symbol, signal)
+        side = (
+            SIDE_BUY
+            if signal == "BUY"
+            else SIDE_SELL
+        )
 
-        time.sleep(0.75)
-        new_position = get_any_symbol_position(symbol)
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+
+        log.warning(
+            "OPENED %s %s quantity=%s",
+            signal,
+            symbol,
+            quantity
+        )
+
+        position = wait_for_position(
+            symbol
+        )
 
         stop_armed = False
-        if new_position:
-            state = get_or_create_state(new_position)
-            stop_armed = bool(arm_initial_stop_loss(new_position))
-            if stop_armed:
-                state["initial_stop_armed"] = True
+
+        if position:
+
+            state = get_position_state(
+                position
+            )
+
+            # Initial stop only when explicitly enabled.
+            if INITIAL_STOP_LOSS_ROI_PCT > 0:
+
+                stop_armed = arm_initial_stop(
+                    position
+                )
+
+                state["initial_stop_armed"] = bool(
+                    stop_armed
+                )
+
+            else:
+
+                log.warning(
+                    "Initial stop disabled for %s",
+                    symbol
+                )
+
+        else:
+
+            log.error(
+                "Entry order sent but position "
+                "could not be confirmed for %s",
+                symbol
+            )
 
         return {
             "status": "executed",
-            "signal": signal,
             "symbol": symbol,
-            "margin_usdt": ORDER_MARGIN_USDT,
-            "leverage": ENTRY_LEVERAGE,
-            "approx_notional_usdt": ORDER_MARGIN_USDT * ENTRY_LEVERAGE,
-            "orderId": order.get("orderId"),
-            "initial_stop_armed": stop_armed
+            "signal": signal,
+            "order_id": order.get("orderId"),
+            "initial_stop_enabled":
+                INITIAL_STOP_LOSS_ROI_PCT > 0,
+            "initial_stop_armed": bool(stop_armed),
+            "position_confirmed": bool(position)
         }
 
 
 # ============================================================
-# MAIN RISK MONITOR
+# RISK MONITOR
 # ============================================================
 
 def check_positions():
+
     global last_snapshot
 
-    open_positions = get_open_positions()
-    current_keys = {position_key(p) for p in open_positions}
+    with entry_lock:
 
-    for key in list(position_states.keys()):
-        if key not in current_keys:
-            position_states.pop(key, None)
+        positions = get_open_positions()
 
-    snapshot_positions = []
-    total_unrealized = 0.0
+        active_keys = {
+            position_key(p)
+            for p in positions
+        }
 
-    for p in open_positions:
-        symbol = p["symbol"]
-        position_side = p.get("positionSide", "BOTH")
-        key = position_key(p)
-        state = get_or_create_state(p)
-        roi = calculate_roi_pct(p)
+        for key in list(position_states):
 
-        unrealized = float(
-            p.get("unRealizedProfit", 0)
-            or p.get("unrealizedProfit", 0)
-            or 0
-        )
-        total_unrealized += unrealized
+            if key not in active_keys:
+                position_states.pop(
+                    key,
+                    None
+                )
 
-        log.info("%s ROI %.2f%%", symbol, roi)
+        total_profit = 0.0
+        snapshot = []
 
-        if roi <= -INITIAL_STOP_LOSS_ROI_PCT:
-            log.warning("%s ROI %.2f%% HARD STOP", symbol, roi)
-            if close_position(p):
-                cancel_bot_stops(symbol, position_side)
-                position_states.pop(key, None)
-            continue
+        for position in positions:
 
-        if roi >= FINAL_TP_ROI_PCT:
-            log.info("%s ROI %.2f%% FINAL TP", symbol, roi)
-            if close_position(p):
-                cancel_bot_stops(symbol, position_side)
-                position_states.pop(key, None)
-            continue
+            symbol = position["symbol"]
+            key = position_key(position)
 
-        if roi >= BREAKEVEN_TRIGGER_ROI_PCT and not state["breakeven_armed"]:
-            if move_stop_to_breakeven(p):
-                state["breakeven_armed"] = True
-                state["initial_stop_armed"] = False
+            state = get_position_state(
+                position
+            )
 
-        elif not state["initial_stop_armed"] and not state["breakeven_armed"]:
-            if arm_initial_stop_loss(p):
-                state["initial_stop_armed"] = True
+            roi = calculate_roi(position)
 
-        if roi >= PARTIAL_TP_ROI_PCT and not state["partial_tp_done"]:
-            if execute_partial_take_profit(p):
-                state["partial_tp_done"] = True
-                time.sleep(0.75)
+            unrealized = float(
+                position.get(
+                    "unRealizedProfit",
+                    position.get(
+                        "unrealizedProfit", 0
+                    )
+                ) or 0
+            )
 
-                remaining = get_current_position(symbol, position_side)
-                if remaining and move_stop_to_breakeven(remaining):
+            total_profit += unrealized
+
+            log.info(
+                "%s ROI %.2f%%",
+                symbol,
+                roi
+            )
+
+            # ======================================
+            # INITIAL STOP LOSS
+            # ======================================
+
+            if (
+                INITIAL_STOP_LOSS_ROI_PCT > 0
+                and roi <= -INITIAL_STOP_LOSS_ROI_PCT
+            ):
+
+                log.warning(
+                    "STOP LOSS %s ROI %.2f%%",
+                    symbol,
+                    roi
+                )
+
+                close_position(position)
+
+                continue
+
+            # ======================================
+            # FINAL TAKE PROFIT
+            # ======================================
+
+            if (
+                FINAL_TP_ROI_PCT > 0
+                and roi >= FINAL_TP_ROI_PCT
+            ):
+
+                log.warning(
+                    "FINAL TP %s ROI %.2f%%",
+                    symbol,
+                    roi
+                )
+
+                close_position(position)
+
+                continue
+
+            # ======================================
+            # BREAKEVEN
+            # ======================================
+
+            if (
+                BREAKEVEN_TRIGGER_ROI_PCT > 0
+                and roi >= BREAKEVEN_TRIGGER_ROI_PCT
+                and not state["breakeven_armed"]
+            ):
+
+                if move_stop_to_breakeven(
+                    position
+                ):
+
                     state["breakeven_armed"] = True
                     state["initial_stop_armed"] = False
 
-        snapshot_positions.append({
-            "symbol": symbol,
-            "positionSide": position_side,
-            "positionAmt": float(p["positionAmt"]),
-            "entryPrice": float(p["entryPrice"]),
-            "markPrice": float(p.get("markPrice", 0) or 0),
-            "leverage": float(p.get("leverage", 0) or 0),
-            "unrealizedProfit": unrealized,
-            "roiPct": round(roi, 2),
-            "initialStopArmed": state["initial_stop_armed"],
-            "breakevenArmed": state["breakeven_armed"],
-            "partialTpDone": state["partial_tp_done"],
-            "lastError": last_errors.get(key)
-        })
+            # ======================================
+            # INITIAL STOP REARM
+            # ======================================
 
-    if PORTFOLIO_PROFIT_USD > 0 and total_unrealized >= PORTFOLIO_PROFIT_USD:
-        log.warning(
-            "Portfolio target reached %.2f >= %.2f",
-            total_unrealized,
-            PORTFOLIO_PROFIT_USD
-        )
+            elif (
+                INITIAL_STOP_LOSS_ROI_PCT > 0
+                and not state["initial_stop_armed"]
+                and not state["breakeven_armed"]
+            ):
 
-        for p in open_positions:
-            close_position(p)
-            cancel_bot_stops(p["symbol"], p.get("positionSide", "BOTH"))
+                if arm_initial_stop(position):
 
-        position_states.clear()
+                    state["initial_stop_armed"] = True
 
-    last_snapshot = {
-        "last_run": time.time(),
-        "positions": snapshot_positions,
-        "total_unrealized_profit": round(total_unrealized, 8)
-    }
+            # ======================================
+            # PARTIAL TAKE PROFIT
+            # ======================================
+
+            if (
+                PARTIAL_TP_ROI_PCT > 0
+                and PARTIAL_CLOSE_PCT > 0
+                and roi >= PARTIAL_TP_ROI_PCT
+                and not state["partial_tp_done"]
+            ):
+
+                if execute_partial_take_profit(
+                    position
+                ):
+
+                    state["partial_tp_done"] = True
+
+                    # After partial TP, breakeven is
+                    # optional and independently
+                    # controlled by its Railway variable.
+                    if BREAKEVEN_TRIGGER_ROI_PCT > 0:
+
+                        remaining = get_current_position(
+                            symbol
+                        )
+
+                        if remaining:
+
+                            if move_stop_to_breakeven(
+                                remaining
+                            ):
+
+                                state["breakeven_armed"] = True
+                                state["initial_stop_armed"] = False
+
+            snapshot.append({
+                "symbol": symbol,
+                "roi_pct": round(roi, 2),
+                "unrealized_profit": unrealized,
+                "initial_stop_armed":
+                    state["initial_stop_armed"],
+                "breakeven_armed":
+                    state["breakeven_armed"],
+                "partial_tp_done":
+                    state["partial_tp_done"]
+            })
+
+        # ==========================================
+        # PORTFOLIO PROFIT TARGET
+        # ==========================================
+
+        if (
+            PORTFOLIO_PROFIT_USD > 0
+            and total_profit >= PORTFOLIO_PROFIT_USD
+        ):
+
+            log.warning(
+                "Portfolio target reached: %.2f",
+                total_profit
+            )
+
+            for position in positions:
+
+                close_position(position)
+
+            position_states.clear()
+
+        last_snapshot = {
+            "last_run": time.time(),
+            "positions": snapshot,
+            "total_unrealized_profit": round(
+                total_profit, 4
+            )
+        }
 
 
 # ============================================================
-# MONITOR LOOP WITH BACKOFF
+# MONITOR LOOP
 # ============================================================
 
 def monitor_loop():
-    log.info("BINANCE manager started")
-    log.info("TradingView entries ENABLED")
+
     log.info(
-        "Entry margin $%.2f | leverage %sx | poll %ss",
-        ORDER_MARGIN_USDT,
-        ENTRY_LEVERAGE,
-        POLL_INTERVAL_SECONDS
-    )
-    log.info(
-        "SL -%.2f%% | BE +%.2f%% | Partial +%.2f%% close %.2f%% | Final +%.2f%%",
-        INITIAL_STOP_LOSS_ROI_PCT,
-        BREAKEVEN_TRIGGER_ROI_PCT,
-        PARTIAL_TP_ROI_PCT,
-        PARTIAL_CLOSE_PCT,
-        FINAL_TP_ROI_PCT
+        "MAQ DH Compatible V3 started"
     )
 
-    rate_limit_backoff = 60
+    log.info(
+        "Initial SL: %s",
+        (
+            f"{INITIAL_STOP_LOSS_ROI_PCT}%"
+            if INITIAL_STOP_LOSS_ROI_PCT > 0
+            else "DISABLED"
+        )
+    )
+
+    log.info(
+        "Breakeven: %s",
+        (
+            f"{BREAKEVEN_TRIGGER_ROI_PCT}%"
+            if BREAKEVEN_TRIGGER_ROI_PCT > 0
+            else "DISABLED"
+        )
+    )
+
+    log.info(
+        "Live orders: %s",
+        ENABLE_LIVE_ORDERS
+    )
+
+    backoff = 60
 
     while True:
+
         try:
-            check_positions()
-            rate_limit_backoff = 60
-            time.sleep(POLL_INTERVAL_SECONDS)
+
+            if ENABLE_LIVE_ORDERS:
+
+                check_positions()
+
+            backoff = 60
+
+            time.sleep(
+                POLL_INTERVAL_SECONDS
+            )
 
         except Exception as exc:
-            log.exception("Monitor iteration failed")
 
-            if is_binance_rate_limit_error(exc):
-                log.warning(
-                    "Binance rate limit reached; pausing %s seconds",
-                    rate_limit_backoff
+            log.exception(
+                "Risk monitor error"
+            )
+
+            if is_rate_limit_error(exc):
+
+                time.sleep(backoff)
+
+                backoff = min(
+                    backoff * 2,
+                    600
                 )
-                time.sleep(rate_limit_backoff)
-                rate_limit_backoff = min(rate_limit_backoff * 2, 600)
+
             else:
-                time.sleep(POLL_INTERVAL_SECONDS)
+
+                time.sleep(
+                    POLL_INTERVAL_SECONDS
+                )
 
 
 # ============================================================
-# ROUTES
+# ORIGINAL DH TRADINGVIEW MESSAGE PARSER
 # ============================================================
 
-@app.route("/")
+def parse_tradingview_message(raw):
+
+    raw = str(raw or "").strip()
+
+    if not raw:
+        raise ValueError(
+            "Empty TradingView message"
+        )
+
+    # MAQ format: BUY|BTCUSDT
+    match = re.fullmatch(
+        r"\s*(BUY|SELL)\s*\|\s*"
+        r"([A-Za-z0-9:._/\-]+)"
+        r"(?:\|[^\r\n]*)?\s*",
+        raw,
+        re.IGNORECASE
+    )
+
+    if match:
+
+        return (
+            match.group(1).upper(),
+            normalize_symbol(
+                match.group(2)
+            )
+        )
+
+    # Original DH order-fill alert.
+    #
+    # DH: (Strategy) Super SmartSuper Trend:
+    # order sell @ 1000 filled on BINANCE:BTCUSDT.P.
+    # New strategy position is -1000
+
+    match = re.search(
+        r"\border\s+(buy|sell)"
+        r"\s+@\s+[^\r\n]*?"
+        r"\bfilled\s+on\s+"
+        r"([A-Za-z0-9:._/\-]+)",
+        raw,
+        re.IGNORECASE
+    )
+
+    if match:
+
+        return (
+            match.group(1).upper(),
+            normalize_symbol(
+                match.group(2).rstrip(".")
+            )
+        )
+
+    raise ValueError(
+        "Unsupported TradingView alert message"
+    )
+
+
+def parse_tradingview_request(req):
+
+    if req.is_json:
+
+        data = req.get_json(
+            silent=True
+        )
+
+        if isinstance(data, dict):
+
+            signal = (
+                data.get("signal")
+                or data.get("action")
+            )
+
+            symbol = (
+                data.get("symbol")
+                or data.get("ticker")
+            )
+
+            if signal and symbol:
+
+                signal = str(
+                    signal
+                ).upper().strip()
+
+                return (
+                    signal,
+                    normalize_symbol(symbol)
+                )
+
+            for field in (
+                "message",
+                "text",
+                "alert"
+            ):
+
+                if isinstance(
+                    data.get(field),
+                    str
+                ):
+
+                    return parse_tradingview_message(
+                        data[field]
+                    )
+
+        elif isinstance(data, str):
+
+            return parse_tradingview_message(
+                data
+            )
+
+    return parse_tradingview_message(
+        req.get_data(
+            as_text=True
+        )
+    )
+
+
+# ============================================================
+# WEBHOOK SECURITY
+# ============================================================
+
+def check_webhook_secret(req):
+
+    if not WEBHOOK_SECRET:
+        return True
+
+    supplied = req.args.get(
+        "secret", ""
+    )
+
+    if not supplied:
+        supplied = req.headers.get(
+            "X-Webhook-Secret", ""
+        )
+
+    return hmac.compare_digest(
+        supplied,
+        WEBHOOK_SECRET
+    )
+
+
+# ============================================================
+# WEB ROUTES
+# ============================================================
+
+@app.route("/", methods=["GET"])
 def health():
+
     return jsonify({
         "status": "ok",
-        "service": "binance-risk-manager",
-        "mode": "TRADINGVIEW_BINANCE"
+        "service": "MAQ DH Compatible V3",
+        "live_orders": ENABLE_LIVE_ORDERS
     })
 
 
-@app.route("/status")
+@app.route("/status", methods=["GET"])
 def status():
+
     return jsonify({
-        "mode": "TRADINGVIEW_BINANCE",
-        "entry_config": {
-            "order_margin_usdt": ORDER_MARGIN_USDT,
-            "entry_leverage": ENTRY_LEVERAGE,
-            "approx_notional_usdt": ORDER_MARGIN_USDT * ENTRY_LEVERAGE
+        "service": "MAQ DH Compatible V3",
+        "live_orders": ENABLE_LIVE_ORDERS,
+        "testnet": BINANCE_TESTNET,
+        "margin_usdt": ORDER_MARGIN_USDT,
+        "leverage": ENTRY_LEVERAGE,
+        "risk_settings": {
+            "initial_stop_loss_roi_pct":
+                INITIAL_STOP_LOSS_ROI_PCT,
+            "initial_stop_enabled":
+                INITIAL_STOP_LOSS_ROI_PCT > 0,
+            "breakeven_trigger_roi_pct":
+                BREAKEVEN_TRIGGER_ROI_PCT,
+            "partial_tp_roi_pct":
+                PARTIAL_TP_ROI_PCT,
+            "partial_close_pct":
+                PARTIAL_CLOSE_PCT,
+            "final_tp_roi_pct":
+                FINAL_TP_ROI_PCT,
+            "portfolio_profit_usd":
+                PORTFOLIO_PROFIT_USD
         },
-        "risk_config": {
-            "poll_interval_seconds": POLL_INTERVAL_SECONDS,
-            "initial_stop_loss_roi_pct": INITIAL_STOP_LOSS_ROI_PCT,
-            "breakeven_trigger_roi_pct": BREAKEVEN_TRIGGER_ROI_PCT,
-            "partial_tp_roi_pct": PARTIAL_TP_ROI_PCT,
-            "partial_close_pct": PARTIAL_CLOSE_PCT,
-            "final_tp_roi_pct": FINAL_TP_ROI_PCT,
-            "portfolio_profit_usd": PORTFOLIO_PROFIT_USD
-        },
-        "position_count": len(last_snapshot.get("positions", [])),
-        "position_states": position_states,
         "snapshot": last_snapshot,
         "errors": last_errors
     })
 
 
-# ============================================================
-# TRADINGVIEW MESSAGE PARSER
-# ============================================================
-
-def parse_tradingview_message(raw):
-    raw = str(raw or "").strip()
-    if not raw:
-        raise ValueError("Empty TradingView message")
-
-    old = re.fullmatch(
-        r"\s*(BUY|SELL)\s*\|\s*([A-Za-z0-9:._/\-]+)(?:\|[^\r\n]*)?\s*",
-        raw,
-        re.IGNORECASE
-    )
-    if old:
-        return old.group(1).upper(), normalize_symbol(old.group(2))
-
-    dh = re.search(
-        r"\border\s+(buy|sell)\s+@\s+[^\r\n]*?\bfilled\s+on\s+"
-        r"([A-Za-z0-9:._/\-]+)",
-        raw,
-        re.IGNORECASE
-    )
-    if dh:
-        return dh.group(1).upper(), normalize_symbol(dh.group(2).rstrip("."))
-
-    raise ValueError("Unsupported TradingView message format")
-
-
-def parse_tradingview_request(req):
-    if req.is_json:
-        data = req.get_json(silent=True)
-        if isinstance(data, dict):
-            signal = data.get("signal") or data.get("action")
-            symbol = data.get("symbol") or data.get("ticker")
-            if signal and symbol:
-                signal = str(signal).strip().upper()
-                if signal not in ("BUY", "SELL"):
-                    raise ValueError("JSON signal must be BUY or SELL")
-                return signal, normalize_symbol(symbol)
-
-            for field in ("message", "text", "alert"):
-                if isinstance(data.get(field), str):
-                    return parse_tradingview_message(data[field])
-
-        elif isinstance(data, str):
-            return parse_tradingview_message(data)
-
-    return parse_tradingview_message(req.get_data(as_text=True))
-
-
 @app.route("/webhook", methods=["POST"])
-def tradingview_webhook():
+def webhook():
+
+    if not check_webhook_secret(request):
+
+        return jsonify({
+            "status": "rejected",
+            "error": "Invalid webhook secret"
+        }), 401
+
     try:
-        signal, symbol = parse_tradingview_request(request)
-        log.info("TradingView signal parsed: %s | %s", signal, symbol)
-        result = process_entry_signal(signal, symbol)
+
+        signal, symbol = parse_tradingview_request(
+            request
+        )
+
+        log.info(
+            "TradingView received: %s %s",
+            signal,
+            symbol
+        )
+
+        result = process_entry_signal(
+            signal,
+            symbol
+        )
+
         return jsonify(result), 200
 
     except ValueError as exc:
-        log.warning("Rejected TradingView webhook: %s", exc)
-        return jsonify({"status": "error", "error": str(exc)}), 400
 
-    except Exception as exc:
-        log.exception("TradingView webhook failed")
-        status_code = 429 if is_binance_rate_limit_error(exc) else 500
+        log.warning(
+            "Invalid alert: %s",
+            exc
+        )
+
         return jsonify({
             "status": "error",
             "error": str(exc)
-        }), status_code
+        }), 400
+
+    except Exception as exc:
+
+        log.exception(
+            "Webhook execution error"
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": str(exc)
+        }), (
+            429 if is_rate_limit_error(exc)
+            else 500
+        )
 
 
 # ============================================================
-# START MONITOR ONCE PER PYTHON PROCESS
+# START BACKGROUND MONITOR
 # ============================================================
 
 def start_monitor():
+
     global monitor_started
 
-    with monitor_start_lock:
+    with monitor_lock:
+
         if monitor_started:
             return
 
@@ -981,14 +1653,27 @@ def start_monitor():
         thread = threading.Thread(
             target=monitor_loop,
             daemon=True,
-            name="binance-position-monitor"
+            name="MAQ-Risk-Monitor"
         )
+
         thread.start()
 
 
 start_monitor()
 
 
+# ============================================================
+# RUN APPLICATION
+# ============================================================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+
+    port = int(
+        os.getenv("PORT", "8080")
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True
+    )
