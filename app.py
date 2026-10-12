@@ -1,238 +1,190 @@
 
 import os
 import re
-import json
 import time
-import hmac
+import json
 import hashlib
-import logging
+import hmac
 import sqlite3
+import logging
 import threading
-import ipaddress
 
 from decimal import Decimal, ROUND_DOWN
 from flask import Flask, request, jsonify
 from binance.client import Client
 
 
-# ============================================================
-# MAQ DH RAILWAY BOT V7
-#
-# Persistent SQLite at /data
-# Original DH TradingView alerts unchanged
-# TradingView IP allowlist
-# Optional webhook secret
-# Fast webhook queue
-# Binance USD-M Futures
-# One-way positions only
-# Software-managed ROI exits
-#
-# LIVE TRADING DISABLED BY DEFAULT
-# ============================================================
+# =====================================================
+# MAQ DH V8
+# Railway + TradingView + Binance USD-M Futures
+# =====================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-log = logging.getLogger("MAQ-V7")
+log = logging.getLogger("MAQ")
 app = Flask(__name__)
 
 
-# ============================================================
-# SETTINGS
-# ============================================================
+# =====================================================
+# CONFIGURATION
+# =====================================================
 
-def setting(name, default=""):
+def env(name, default=""):
     value = os.getenv(name)
     return str(default if value is None else value).strip()
 
 
+def flag(name, default=False):
+    value = env(
+        name,
+        "true" if default else "false"
+    ).lower()
+
+    return value in ("true", "1", "yes", "on")
+
+
 def number(name, default=0):
-    value = setting(name)
+    value = env(name)
     return float(value) if value else float(default)
 
 
-def boolean(name, default=False):
-    return setting(
-        name,
-        "true" if default else "false"
-    ).lower() in ("true", "1", "yes", "on")
+API_KEY = env("BINANCE_API_KEY")
+API_SECRET = env("BINANCE_API_SECRET")
 
+LIVE = flag("ENABLE_LIVE_ORDERS", False)
+TESTNET = flag("BINANCE_TESTNET", False)
 
-API_KEY = setting("BINANCE_API_KEY")
-API_SECRET = setting("BINANCE_API_SECRET")
-
-TESTNET = boolean("BINANCE_TESTNET", True)
-LIVE = boolean("ENABLE_LIVE_ORDERS", False)
-
-WEBHOOK_SECRET = setting("WEBHOOK_SECRET")
-STATUS_SECRET = setting("STATUS_SECRET")
-
-# Explicitly acknowledge IP-only authentication risk.
-ALLOW_IP_ONLY_LIVE = boolean(
-    "ALLOW_TV_IP_ONLY_LIVE", False
-)
+WEBHOOK_SECRET = env("WEBHOOK_SECRET")
 
 MARGIN = number("ORDER_MARGIN_USDT", 50)
 LEVERAGE = int(number("ENTRY_LEVERAGE", 16))
 
-INITIAL_SL = number("INITIAL_STOP_LOSS_ROI_PCT")
-BREAKEVEN = number("BREAKEVEN_TRIGGER_ROI_PCT")
-PARTIAL_TP = number("PARTIAL_TP_ROI_PCT")
-PARTIAL_CLOSE = number("PARTIAL_CLOSE_PCT")
-FINAL_TP = number("FINAL_TP_ROI_PCT")
+INITIAL_SL = number("INITIAL_STOP_LOSS_ROI_PCT", 0)
+BREAKEVEN = number("BREAKEVEN_TRIGGER_ROI_PCT", 0)
 
-PORTFOLIO_TARGET = number(
-    "PORTFOLIO_PROFIT_USD"
-)
+PARTIAL_TP = number("PARTIAL_TP_ROI_PCT", 0)
+PARTIAL_CLOSE = number("PARTIAL_CLOSE_PCT", 50)
+
+FINAL_TP = number("FINAL_TP_ROI_PCT", 0)
+PORTFOLIO_TARGET = number("PORTFOLIO_PROFIT_USD", 0)
 
 POLL = max(
     5,
     int(number("POLL_INTERVAL_SECONDS", 5))
 )
 
-MAX_AGE = max(
-    60,
+MAX_ALERT_AGE = max(
+    30,
     int(number("MAX_ALERT_AGE_SECONDS", 180))
 )
 
-DB_PATH = setting(
+DB_PATH = env(
     "BOT_DB_PATH",
     "/data/maq_bot.sqlite3"
 )
 
-TRADINGVIEW_IPS = {
-    "52.89.214.238",
-    "34.212.75.30",
-    "54.218.53.128",
-    "52.32.178.7"
-}
+if LIVE and not API_KEY:
+    raise RuntimeError("Missing BINANCE_API_KEY")
+
+if LIVE and not API_SECRET:
+    raise RuntimeError("Missing BINANCE_API_SECRET")
+
+if MARGIN <= 0 or LEVERAGE <= 0:
+    raise RuntimeError("Invalid margin or leverage")
+
+if PARTIAL_CLOSE < 0 or PARTIAL_CLOSE > 100:
+    raise RuntimeError("Invalid partial close percentage")
 
 
-# ============================================================
-# STARTUP VALIDATION
-# ============================================================
+# =====================================================
+# DATABASE
+# =====================================================
 
-if not os.path.isdir("/data"):
-    raise RuntimeError(
-        "Railway persistent volume missing at /data"
-    )
+os.makedirs(
+    os.path.dirname(DB_PATH) or ".",
+    exist_ok=True
+)
 
-if not DB_PATH.startswith("/data/"):
-    raise RuntimeError(
-        "BOT_DB_PATH must be inside /data"
-    )
+DB_LOCK = threading.RLock()
+TRADE_LOCK = threading.RLock()
+CLIENT_LOCK = threading.Lock()
 
-if MARGIN <= 0:
-    raise RuntimeError("Invalid margin")
-
-if not 1 <= LEVERAGE <= 125:
-    raise RuntimeError("Invalid leverage")
-
-for value in (
-    INITIAL_SL,
-    BREAKEVEN,
-    PARTIAL_TP,
-    PARTIAL_CLOSE,
-    FINAL_TP
-):
-    if not 0 <= value <= 100:
-        raise RuntimeError(
-            "Risk percentages must be 0 to 100"
-        )
-
-if LIVE:
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError(
-            "Binance credentials required"
-        )
-
-    if not STATUS_SECRET:
-        raise RuntimeError(
-            "STATUS_SECRET required for live trading"
-        )
-
-    if not WEBHOOK_SECRET and not ALLOW_IP_ONLY_LIVE:
-        raise RuntimeError(
-            "Set WEBHOOK_SECRET or explicitly set "
-            "ALLOW_TV_IP_ONLY_LIVE=true"
-        )
+_client = None
 
 
-# ============================================================
-# SQLITE
-# ============================================================
-
-def db():
+def database():
     conn = sqlite3.connect(
         DB_PATH,
-        timeout=10,
-        isolation_level=None
+        timeout=20
     )
 
     conn.row_factory = sqlite3.Row
 
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=20000")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
 
     return conn
 
 
-def initialize():
-    with db() as conn:
+def initialize_database():
+    with DB_LOCK, database() as conn:
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fingerprint TEXT UNIQUE NOT NULL,
-                symbol TEXT NOT NULL,
-                signal TEXT NOT NULL,
-                raw_message TEXT NOT NULL,
-                received_at REAL NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
+                fingerprint TEXT UNIQUE,
+                symbol TEXT,
+                signal TEXT,
+                raw_message TEXT,
+                received_at REAL,
+                status TEXT DEFAULT 'pending',
                 error TEXT,
-                updated_at REAL NOT NULL
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS position_state (
-                symbol TEXT PRIMARY KEY,
-                entry_price REAL NOT NULL,
-                entry_qty REAL NOT NULL,
-                partial_done INTEGER NOT NULL DEFAULT 0,
-                breakeven_done INTEGER NOT NULL DEFAULT 0,
-                initial_stop_done INTEGER NOT NULL DEFAULT 0
+                updated_at REAL
             )
         """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_positions (
                 symbol TEXT PRIMARY KEY,
-                direction TEXT NOT NULL,
-                created_at REAL NOT NULL
+                direction TEXT,
+                created_at REAL
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS position_state (
+                symbol TEXT PRIMARY KEY,
+                entry_price REAL,
+                entry_qty REAL,
+                partial_done INTEGER DEFAULT 0,
+                breakeven_done INTEGER DEFAULT 0
+            )
+        """)
 
-initialize()
+        # An interrupted trade must not be blindly replayed.
+        conn.execute("""
+            UPDATE alerts
+            SET status='needs_review',
+                error='Interrupted execution; check Binance',
+                updated_at=?
+            WHERE status='processing'
+        """, (time.time(),))
 
 
-# ============================================================
-# CLIENT
-# ============================================================
-
-_client = None
-client_lock = threading.Lock()
-trade_lock = threading.RLock()
+initialize_database()
 
 
-def get_client():
+# =====================================================
+# BINANCE CLIENT
+# =====================================================
+
+def client():
     global _client
 
-    with client_lock:
+    with CLIENT_LOCK:
         if _client is None:
             _client = Client(
                 API_KEY,
@@ -243,54 +195,9 @@ def get_client():
         return _client
 
 
-# ============================================================
-# SECURITY
-# ============================================================
-
-def tradingview_source(req):
-    """
-    Railway public HTTP edge supplies X-Real-IP.
-
-    This must not be exposed over untrusted private
-    networking or an alternate proxy that permits
-    callers to forge X-Real-IP.
-    """
-
-    raw = req.headers.get("X-Real-IP", "").strip()
-
-    try:
-        address = str(ipaddress.ip_address(raw))
-    except ValueError:
-        return False
-
-    return address in TRADINGVIEW_IPS
-
-
-def secret_valid(req, expected):
-    supplied = (
-        req.args.get("secret", "")
-        or req.headers.get("X-Webhook-Secret", "")
-    )
-
-    return bool(expected) and hmac.compare_digest(
-        supplied,
-        expected
-    )
-
-
-def webhook_allowed(req):
-    if WEBHOOK_SECRET and secret_valid(
-        req,
-        WEBHOOK_SECRET
-    ):
-        return True
-
-    return tradingview_source(req)
-
-
-# ============================================================
-# PARSER
-# ============================================================
+# =====================================================
+# TRADINGVIEW PARSER
+# =====================================================
 
 def normalize_symbol(raw):
     symbol = str(raw).strip().upper().rstrip(".")
@@ -313,42 +220,42 @@ def normalize_symbol(raw):
     return symbol
 
 
-def parse_alert(text):
-    text = str(text or "").strip()
+def parse_message(message):
+    message = str(message).strip()
 
-    match = re.fullmatch(
+    legacy = re.fullmatch(
         r"(BUY|SELL)\s*\|\s*"
         r"([A-Za-z0-9:._/\-]+)"
         r"(?:\|[^\r\n]*)?",
-        text,
+        message,
         re.IGNORECASE
     )
 
-    if match:
+    if legacy:
         return (
-            match.group(1).upper(),
-            normalize_symbol(match.group(2))
+            legacy.group(1).upper(),
+            normalize_symbol(legacy.group(2))
         )
 
-    match = re.search(
+    dh = re.search(
         r"\border\s+(buy|sell)\s+@\s+"
         r"[^\r\n]*?\bfilled\s+on\s+"
         r"([A-Za-z0-9:._/\-]+)",
-        text,
+        message,
         re.IGNORECASE
     )
 
-    if match:
+    if dh:
         return (
-            match.group(1).upper(),
-            normalize_symbol(match.group(2))
+            dh.group(1).upper(),
+            normalize_symbol(dh.group(2))
         )
 
-    raise ValueError("Unsupported alert message")
+    raise ValueError("Unsupported TradingView alert")
 
 
-def extract_alert(req):
-    data = req.get_json(silent=True)
+def extract_alert():
+    data = request.get_json(silent=True)
 
     if isinstance(data, dict):
         signal = data.get("signal") or data.get("action")
@@ -368,47 +275,59 @@ def extract_alert(req):
 
         for key in ("message", "text", "alert"):
             if isinstance(data.get(key), str):
-                signal, symbol = parse_alert(data[key])
+                signal, symbol = parse_message(data[key])
+
                 return signal, symbol, data[key]
 
     raw = (
-        data
-        if isinstance(data, str)
-        else req.get_data(as_text=True)
+        data if isinstance(data, str)
+        else request.get_data(as_text=True)
     )
 
-    signal, symbol = parse_alert(raw)
+    signal, symbol = parse_message(raw)
 
     return signal, symbol, raw
 
 
-# ============================================================
+# =====================================================
 # WEBHOOK
-# ============================================================
+# =====================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if not webhook_allowed(request):
-        return jsonify({
-            "status": "rejected",
-            "reason": "Source not authenticated"
-        }), 403
+
+    # Optional authentication.
+    # Leaving WEBHOOK_SECRET empty preserves old alerts,
+    # but makes the endpoint unauthenticated.
+
+    if WEBHOOK_SECRET:
+        supplied = (
+            request.args.get("secret", "")
+            or request.headers.get("X-Webhook-Secret", "")
+        )
+
+        if not hmac.compare_digest(
+            supplied,
+            WEBHOOK_SECRET
+        ):
+            return jsonify(
+                error="Unauthorized"
+            ), 403
 
     try:
-        signal, symbol, raw = extract_alert(request)
+        signal, symbol, raw = extract_alert()
 
         now = time.time()
 
-        # Duplicate suppression is approximate.
-        # Identical genuine signals inside this window
-        # may also be suppressed.
+        # Duplicate suppression for identical alerts
+        # within a 15-minute window.
         bucket = int(now // 900)
 
         fingerprint = hashlib.sha256(
             f"{bucket}|{signal}|{symbol}|{raw}".encode()
         ).hexdigest()
 
-        with db() as conn:
+        with DB_LOCK, database() as conn:
             cursor = conn.execute("""
                 INSERT OR IGNORE INTO alerts (
                     fingerprint,
@@ -431,76 +350,125 @@ def webhook():
 
             inserted = cursor.rowcount == 1
 
+        status = "queued" if inserted else "duplicate"
+
         log.info(
             "Alert %s %s: %s",
             signal,
             symbol,
-            "queued" if inserted else "duplicate"
+            status
         )
 
-        return jsonify({
-            "status": (
-                "queued" if inserted else "duplicate"
-            ),
-            "symbol": symbol,
-            "signal": signal
-        }), 200
+        return jsonify(
+            status=status,
+            symbol=symbol,
+            signal=signal
+        )
 
     except ValueError as exc:
-        return jsonify({
-            "error": str(exc)
-        }), 400
+        return jsonify(error=str(exc)), 400
 
     except Exception:
-        log.exception("Webhook error")
-        return jsonify({
-            "error": "Queue unavailable"
-        }), 503
+        log.exception("Webhook failure")
+        return jsonify(error="Queue unavailable"), 503
 
 
-# ============================================================
-# BINANCE HELPERS
-# ============================================================
+# =====================================================
+# POSITION OWNERSHIP
+# =====================================================
 
-def assert_one_way():
-    result = get_client().futures_get_position_mode()
+def owned(symbol):
+    with DB_LOCK, database() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM bot_positions WHERE symbol=?",
+            (symbol,)
+        ).fetchone()
 
-    if result.get("dualSidePosition"):
-        raise RuntimeError(
-            "Binance must use One-way Position Mode"
+        return row is not None
+
+
+def save_owned(symbol, direction):
+    with DB_LOCK, database() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO bot_positions
+            (symbol, direction, created_at)
+            VALUES (?, ?, ?)
+        """, (
+            symbol,
+            direction,
+            time.time()
+        ))
+
+
+def remove_owned(symbol):
+    with DB_LOCK, database() as conn:
+        conn.execute(
+            "DELETE FROM bot_positions WHERE symbol=?",
+            (symbol,)
+        )
+
+        conn.execute(
+            "DELETE FROM position_state WHERE symbol=?",
+            (symbol,)
         )
 
 
-def symbol_info(symbol):
-    info = get_client().futures_exchange_info()
+# =====================================================
+# BINANCE POSITION HELPERS
+# =====================================================
 
-    for item in info["symbols"]:
-        if item["symbol"] == symbol:
-            if item["status"] != "TRADING":
-                raise RuntimeError("Symbol not trading")
+def positions(symbol=None):
+    args = {"symbol": symbol} if symbol else {}
 
-            return item
-
-    raise RuntimeError(
-        f"Unknown Binance Futures symbol {symbol}"
+    result = client().futures_position_information(
+        **args
     )
+
+    return [
+        p for p in result
+        if abs(float(p["positionAmt"])) > 0
+    ]
+
+
+def current_position(symbol):
+    result = positions(symbol)
+
+    if len(result) > 1:
+        raise RuntimeError("Hedge Mode unsupported")
+
+    if result:
+        if result[0].get(
+            "positionSide", "BOTH"
+        ) != "BOTH":
+            raise RuntimeError("One-way Mode required")
+
+        return result[0]
+
+    return None
 
 
 def quantity_step(symbol):
-    info = symbol_info(symbol)
+    exchange = client().futures_exchange_info()
 
-    for filter_type in (
-        "MARKET_LOT_SIZE",
-        "LOT_SIZE"
-    ):
-        for item in info["filters"]:
-            if item["filterType"] == filter_type:
-                step = Decimal(item["stepSize"])
+    for item in exchange["symbols"]:
+        if item["symbol"] != symbol:
+            continue
 
-                if step > 0:
-                    return step
+        if item["status"] != "TRADING":
+            raise RuntimeError("Symbol not trading")
 
-    raise RuntimeError("Quantity step unavailable")
+        for filter_type in (
+            "MARKET_LOT_SIZE",
+            "LOT_SIZE"
+        ):
+            for item_filter in item["filters"]:
+                if item_filter["filterType"] == filter_type:
+                    step = Decimal(item_filter["stepSize"])
+
+                    if step > 0:
+                        return step
+
+    raise RuntimeError("Symbol quantity step unavailable")
 
 
 def rounded_quantity(symbol, quantity):
@@ -515,80 +483,37 @@ def rounded_quantity(symbol, quantity):
     )
 
 
-def current_position(symbol):
-    rows = get_client().futures_position_information(
-        symbol=symbol
+def market_order(
+    symbol,
+    side,
+    quantity,
+    reduce_only=False
+):
+    quantity = rounded_quantity(
+        symbol,
+        quantity
     )
 
-    active = [
-        row for row in rows
-        if abs(float(row["positionAmt"])) > 0
-    ]
-
-    if len(active) > 1:
-        raise RuntimeError(
-            "Multiple position sides unsupported"
-        )
-
-    if active:
-        if active[0].get(
-            "positionSide", "BOTH"
-        ) != "BOTH":
-            raise RuntimeError("Hedge Mode unsupported")
-
-        return active[0]
-
-    return None
-
-
-def all_positions():
-    return [
-        row
-        for row in get_client().futures_position_information()
-        if abs(float(row["positionAmt"])) > 0
-    ]
-
-
-def roi(position):
-    entry = float(position["entryPrice"])
-    mark = float(position.get("markPrice", 0) or 0)
-    amount = float(position["positionAmt"])
-    leverage = float(position.get("leverage", 1) or 1)
-
-    if entry <= 0 or mark <= 0:
-        raise RuntimeError("Invalid position pricing")
-
-    result = (mark - entry) / entry
-
-    if amount < 0:
-        result = -result
-
-    return result * leverage * 100
-
-
-def market_order(symbol, side, qty, reduce_only=False):
-    qty = rounded_quantity(symbol, qty)
-
-    if qty <= 0:
-        raise RuntimeError("Quantity too small")
+    if quantity <= 0:
+        raise RuntimeError("Order quantity too small")
 
     args = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "quantity": qty
+        "quantity": quantity
     }
 
     if reduce_only:
         args["reduceOnly"] = True
 
-    return get_client().futures_create_order(**args)
+    return client().futures_create_order(**args)
 
 
 def close_position(position, fraction=1):
     amount = float(position["positionAmt"])
 
-    if not amount:
+    if amount == 0:
         return None
 
     side = "SELL" if amount > 0 else "BUY"
@@ -605,11 +530,10 @@ def wait_position(symbol, direction=None):
     for _ in range(20):
         position = current_position(symbol)
 
-        if direction is None:
-            if position is None:
-                return None
+        if direction is None and position is None:
+            return None
 
-        elif position:
+        if direction and position:
             amount = float(position["positionAmt"])
 
             if (
@@ -622,50 +546,21 @@ def wait_position(symbol, direction=None):
         time.sleep(0.5)
 
     raise RuntimeError(
-        f"Position confirmation timeout: {symbol}"
+        "Position confirmation timeout; "
+        "manual review required"
     )
 
 
-# ============================================================
-# BOT OWNERSHIP
-# ============================================================
+# =====================================================
+# POSITION STATE
+# =====================================================
 
-def is_bot_position(symbol):
-    with db() as conn:
-        return conn.execute(
-            "SELECT 1 FROM bot_positions WHERE symbol=?",
-            (symbol,)
-        ).fetchone() is not None
-
-
-def save_bot_position(symbol, direction):
-    with db() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO bot_positions
-            (symbol, direction, created_at)
-            VALUES (?, ?, ?)
-        """, (symbol, direction, time.time()))
-
-
-def remove_bot_position(symbol):
-    with db() as conn:
-        conn.execute(
-            "DELETE FROM bot_positions WHERE symbol=?",
-            (symbol,)
-        )
-
-        conn.execute(
-            "DELETE FROM position_state WHERE symbol=?",
-            (symbol,)
-        )
-
-
-def get_state(position):
+def position_state(position):
     symbol = position["symbol"]
     entry = float(position["entryPrice"])
-    qty = abs(float(position["positionAmt"]))
+    quantity = abs(float(position["positionAmt"]))
 
-    with db() as conn:
+    with DB_LOCK, database() as conn:
         row = conn.execute(
             "SELECT * FROM position_state WHERE symbol=?",
             (symbol,)
@@ -679,7 +574,11 @@ def get_state(position):
                     entry_qty
                 )
                 VALUES (?, ?, ?)
-            """, (symbol, entry, qty))
+            """, (
+                symbol,
+                entry,
+                quantity
+            ))
 
             row = conn.execute(
                 "SELECT * FROM position_state WHERE symbol=?",
@@ -690,22 +589,20 @@ def get_state(position):
             float(row["entry_price"]) - entry
         ) > max(entry * 0.000001, 1e-12):
             raise RuntimeError(
-                "Position entry changed unexpectedly; "
-                "manual reconciliation required"
+                "Entry price changed; manual review required"
             )
 
         return dict(row)
 
 
-def update_state(symbol, field):
+def mark_state(symbol, field):
     if field not in (
         "partial_done",
-        "breakeven_done",
-        "initial_stop_done"
+        "breakeven_done"
     ):
         raise ValueError("Invalid state field")
 
-    with db() as conn:
+    with DB_LOCK, database() as conn:
         conn.execute(
             f"UPDATE position_state SET {field}=1 "
             "WHERE symbol=?",
@@ -713,78 +610,108 @@ def update_state(symbol, field):
         )
 
 
-# ============================================================
-# ENTRY
-# ============================================================
+def calculate_roi(position):
+    entry = float(position["entryPrice"])
+    mark = float(position.get("markPrice") or 0)
+
+    if entry <= 0 or mark <= 0:
+        raise RuntimeError("Invalid mark price")
+
+    direction = (
+        1 if float(position["positionAmt"]) > 0
+        else -1
+    )
+
+    leverage = float(
+        position.get("leverage") or 1
+    )
+
+    return (
+        (mark - entry) / entry
+        * direction
+        * leverage
+        * 100
+    )
+
+
+# =====================================================
+# EXECUTE SIGNAL
+# =====================================================
 
 def execute_signal(signal, symbol):
-    with trade_lock:
-        assert_one_way()
 
-        current = current_position(symbol)
+    with TRADE_LOCK:
 
-        if current:
-            if not is_bot_position(symbol):
+        mode = client().futures_get_position_mode()
+
+        if mode.get("dualSidePosition"):
+            raise RuntimeError(
+                "Binance One-way Position Mode required"
+            )
+
+        existing = current_position(symbol)
+
+        if existing:
+            if not owned(symbol):
                 raise RuntimeError(
-                    "Existing non-bot position detected; "
-                    "refusing to modify it"
+                    "Existing non-bot position; "
+                    "refusing to modify"
                 )
 
-            direction = (
+            current_direction = (
                 "BUY"
-                if float(current["positionAmt"]) > 0
+                if float(existing["positionAmt"]) > 0
                 else "SELL"
             )
 
-            if direction == signal:
+            if current_direction == signal:
                 return "already_in_position"
 
-            # Close first; never open opposite side until
-            # exchange confirms the position is flat.
-            close_position(current)
-            wait_position(symbol, None)
-            remove_bot_position(symbol)
+            close_position(existing)
+            wait_position(symbol)
+            remove_owned(symbol)
 
-        get_client().futures_change_leverage(
+        client().futures_change_leverage(
             symbol=symbol,
             leverage=LEVERAGE
         )
 
-        price = float(
-            get_client().futures_symbol_ticker(
-                symbol=symbol
-            )["price"]
+        ticker = client().futures_symbol_ticker(
+            symbol=symbol
         )
 
-        qty = MARGIN * LEVERAGE / price
+        price = float(ticker["price"])
 
-        order = market_order(
+        quantity = MARGIN * LEVERAGE / price
+
+        result = market_order(
             symbol,
             signal,
-            qty
+            quantity
         )
 
         log.warning(
-            "Entry submitted %s %s order=%s",
+            "Order submitted %s %s ID=%s",
             signal,
             symbol,
-            order.get("orderId")
+            result.get("orderId")
         )
 
         position = wait_position(symbol, signal)
 
-        save_bot_position(symbol, signal)
-        get_state(position)
+        save_owned(symbol, signal)
+        position_state(position)
 
         return "executed"
 
 
-# ============================================================
-# QUEUE
-# ============================================================
+# =====================================================
+# ALERT QUEUE
+# =====================================================
 
 def claim_alert():
-    with db() as conn:
+    with DB_LOCK, database() as conn:
+
         conn.execute("BEGIN IMMEDIATE")
 
         row = conn.execute("""
@@ -801,7 +728,10 @@ def claim_alert():
                 SET status='processing',
                     updated_at=?
                 WHERE id=?
-            """, (time.time(), row["id"]))
+            """, (
+                time.time(),
+                row["id"]
+            ))
 
         conn.commit()
 
@@ -809,7 +739,7 @@ def claim_alert():
 
 
 def finish_alert(alert_id, status, error=None):
-    with db() as conn:
+    with DB_LOCK, database() as conn:
         conn.execute("""
             UPDATE alerts
             SET status=?,
@@ -825,7 +755,12 @@ def finish_alert(alert_id, status, error=None):
 
 
 def queue_worker():
-    log.info("MAQ queue worker started")
+    log.info(
+        "MAQ queue worker started "
+        "(live=%s, testnet=%s)",
+        LIVE,
+        TESTNET
+    )
 
     while True:
         try:
@@ -835,10 +770,14 @@ def queue_worker():
                 time.sleep(0.5)
                 continue
 
-            alert_id = alert["id"]
-
-            if time.time() - alert["received_at"] > MAX_AGE:
-                finish_alert(alert_id, "expired")
+            if (
+                time.time() - alert["received_at"]
+                > MAX_ALERT_AGE
+            ):
+                finish_alert(
+                    alert["id"],
+                    "expired"
+                )
                 continue
 
             if not LIVE:
@@ -848,7 +787,10 @@ def queue_worker():
                     alert["symbol"]
                 )
 
-                finish_alert(alert_id, "dry_run")
+                finish_alert(
+                    alert["id"],
+                    "dry_run"
+                )
                 continue
 
             try:
@@ -857,72 +799,85 @@ def queue_worker():
                     alert["symbol"]
                 )
 
-                finish_alert(alert_id, result)
+                finish_alert(
+                    alert["id"],
+                    result
+                )
 
             except Exception as exc:
                 log.exception(
-                    "Execution requires review"
+                    "Trade execution requires review"
                 )
 
                 finish_alert(
-                    alert_id,
+                    alert["id"],
                     "needs_review",
                     str(exc)[:500]
                 )
 
         except Exception:
-            log.exception("Queue failure")
+            log.exception("Queue worker error")
             time.sleep(2)
 
 
-# ============================================================
+# =====================================================
 # RISK MONITOR
-# ============================================================
+# =====================================================
 
-def monitor():
+def monitor_risk():
     if not LIVE:
         return
 
-    with trade_lock:
-        assert_one_way()
+    with TRADE_LOCK:
 
-        positions = [
-            p for p in all_positions()
-            if is_bot_position(p["symbol"])
+        active = [
+            p for p in positions()
+            if owned(p["symbol"])
         ]
 
         total_profit = sum(
-            float(p.get("unRealizedProfit", 0) or 0)
-            for p in positions
+            float(
+                p.get("unRealizedProfit") or 0
+            )
+            for p in active
         )
 
         if (
             PORTFOLIO_TARGET > 0
             and total_profit >= PORTFOLIO_TARGET
         ):
-            for p in positions:
-                symbol = p["symbol"]
-                close_position(p)
-                wait_position(symbol, None)
-                remove_bot_position(symbol)
+            for position in active:
+                symbol = position["symbol"]
+
+                close_position(position)
+                wait_position(symbol)
+                remove_owned(symbol)
 
             return
 
-        for p in positions:
-            symbol = p["symbol"]
-            value = roi(p)
-            state = get_state(p)
+        for position in active:
+            symbol = position["symbol"]
 
-            if INITIAL_SL > 0 and value <= -INITIAL_SL:
-                close_position(p)
-                wait_position(symbol, None)
-                remove_bot_position(symbol)
+            value = calculate_roi(position)
+            state = position_state(position)
+
+            # Initial stop loss disabled when blank or zero.
+            if (
+                INITIAL_SL > 0
+                and value <= -INITIAL_SL
+            ):
+                close_position(position)
+                wait_position(symbol)
+                remove_owned(symbol)
                 continue
 
-            if FINAL_TP > 0 and value >= FINAL_TP:
-                close_position(p)
-                wait_position(symbol, None)
-                remove_bot_position(symbol)
+            if (
+                FINAL_TP > 0
+                and value >= FINAL_TP
+            ):
+                close_position(position)
+                wait_position(symbol)
+                remove_owned(symbol)
                 continue
 
             if (
@@ -930,16 +885,20 @@ def monitor():
                 and value >= BREAKEVEN
                 and not state["breakeven_done"]
             ):
-                update_state(symbol, "breakeven_done")
+                mark_state(
+                    symbol,
+                    "breakeven_done"
+                )
+
                 state["breakeven_done"] = 1
 
             if (
                 state["breakeven_done"]
                 and value <= 0
             ):
-                close_position(p)
-                wait_position(symbol, None)
-                remove_bot_position(symbol)
+                close_position(position)
+                wait_position(symbol)
+                remove_owned(symbol)
                 continue
 
             if (
@@ -949,15 +908,18 @@ def monitor():
                 and not state["partial_done"]
             ):
                 result = close_position(
-                    p,
+                    position,
                     PARTIAL_CLOSE / 100
                 )
 
                 if result:
-                    update_state(symbol, "partial_done")
+                    mark_state(
+                        symbol,
+                        "partial_done"
+                    )
 
                     if BREAKEVEN > 0:
-                        update_state(
+                        mark_state(
                             symbol,
                             "breakeven_done"
                         )
@@ -968,100 +930,69 @@ def risk_worker():
 
     while True:
         try:
-            monitor()
+            monitor_risk()
         except Exception:
-            log.exception("Risk monitor failure")
+            log.exception("Risk monitor error")
 
         time.sleep(POLL)
 
 
-# ============================================================
+# =====================================================
 # HEALTH AND STATUS
-# ============================================================
+# =====================================================
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "service": "MAQ DH V7",
-        "live_orders": LIVE,
-        "testnet": TESTNET
-    })
+    return jsonify(
+        status="ok",
+        bot="MAQ DH V8",
+        live=LIVE,
+        testnet=TESTNET
+    )
 
 
 @app.route("/status", methods=["GET"])
 def status():
-    if not STATUS_SECRET or not secret_valid(
-        request,
-        STATUS_SECRET
-    ):
-        return jsonify({
-            "error": "Unauthorized"
-        }), 401
-
-    with db() as conn:
-        counts = conn.execute("""
+    with DB_LOCK, database() as conn:
+        rows = conn.execute("""
             SELECT status, COUNT(*) AS count
             FROM alerts
             GROUP BY status
         """).fetchall()
 
-        recent = conn.execute("""
-            SELECT id, symbol, signal,
-                   status, error, received_at
-            FROM alerts
-            ORDER BY id DESC
-            LIMIT 20
-        """).fetchall()
-
-    return jsonify({
-        "service": "MAQ DH V7",
-        "live_orders": LIVE,
-        "testnet": TESTNET,
-        "queue": {
+    return jsonify(
+        bot="MAQ DH V8",
+        live=LIVE,
+        testnet=TESTNET,
+        queue={
             row["status"]: row["count"]
-            for row in counts
-        },
-        "recent_alerts": [
-            dict(row) for row in recent
-        ],
-        "settings": {
-            "margin": MARGIN,
-            "leverage": LEVERAGE,
-            "initial_stop_loss_roi_pct": INITIAL_SL,
-            "breakeven_roi_pct": BREAKEVEN,
-            "partial_tp_roi_pct": PARTIAL_TP,
-            "partial_close_pct": PARTIAL_CLOSE,
-            "final_tp_roi_pct": FINAL_TP,
-            "portfolio_profit_usd": PORTFOLIO_TARGET
+            for row in rows
         }
-    })
+    )
 
 
-# ============================================================
-# START
-# ============================================================
+# =====================================================
+# START WORKERS
+# =====================================================
 
-def start_workers():
-    threading.Thread(
-        target=queue_worker,
-        daemon=True,
-        name="MAQ-Queue"
-    ).start()
+# Use one Gunicorn worker and one Railway replica.
 
-    threading.Thread(
-        target=risk_worker,
-        daemon=True,
-        name="MAQ-Risk"
-    ).start()
+threading.Thread(
+    target=queue_worker,
+    daemon=True,
+    name="MAQ-Queue"
+).start()
 
-
-start_workers()
+threading.Thread(
+    target=risk_worker,
+    daemon=True,
+    name="MAQ-Risk"
+).start()
 
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(setting("PORT", 8080)),
+        port=int(env("PORT", 8080)),
         threaded=True
     )
