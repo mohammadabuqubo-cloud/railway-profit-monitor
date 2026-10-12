@@ -1,42 +1,33 @@
 
 import os
 import re
-import time
 import json
+import time
 import hmac
 import hashlib
 import logging
 import sqlite3
 import threading
-import urllib.parse
-import urllib.request
-import urllib.error
-
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, ROUND_DOWN
 from flask import Flask, request, jsonify
 from binance.client import Client
-from binance.enums import SIDE_BUY, SIDE_SELL
 
 
 # ============================================================
-# MAQ DH RAILWAY BOT V4
-# FAST WEBHOOK / PERSISTENT QUEUE / BINANCE FUTURES
+# MAQ DH BINANCE FUTURES BOT V6
 #
-# - Original DH TradingView alert messages
-# - Existing BUY|SYMBOL / SELL|SYMBOL messages
-# - Fast webhook acknowledgment
-# - Persistent SQLite queue
-# - Duplicate alert suppression
-# - One-way mode only (no Binance Hedge Mode)
-# - Opposite-signal reversals
-# - Railway-controlled stop loss and take profit
-# - Empty initial stop loss = disabled
-# - Dry-run by default
+# Persistent SQLite queue: /data
+# Fast TradingView webhook response
+# Original DH strategy message support
+# BUY|SYMBOL and SELL|SYMBOL support
+# One-way Binance Futures positions
+# Opposite-signal reversal
+# Railway-variable risk settings
 #
-# IMPORTANT:
-# A persistent Railway volume is required.
-# One Gunicorn worker and one Railway replica only.
+# EMPTY INITIAL_STOP_LOSS_ROI_PCT = DISABLED
+#
+# Single Railway replica / single Gunicorn worker.
+# Dry-run by default.
 # ============================================================
 
 
@@ -45,116 +36,124 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-log = logging.getLogger("MAQ-DH-V4")
+log = logging.getLogger("MAQ-DH-V6")
 app = Flask(__name__)
 
 
 # ============================================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT
 # ============================================================
 
 def env(name, default=""):
-    return str(os.getenv(name, default) or "").strip()
+    value = os.getenv(name)
+    return str(default if value is None else value).strip()
 
 
-def number(name, default=0):
-    raw = env(name)
-    return float(raw) if raw else float(default)
+def env_float(name, default=0):
+    value = env(name)
+    return float(value) if value else float(default)
 
 
-def integer(name, default=0):
-    raw = env(name)
-    return int(raw) if raw else int(default)
+def env_int(name, default=0):
+    value = env(name)
+    return int(value) if value else int(default)
 
 
-def percentage(name):
-    raw = env(name)
-    if not raw:
+def env_bool(name, default=False):
+    value = env(
+        name,
+        "true" if default else "false"
+    ).lower()
+
+    return value in ("true", "1", "yes", "on")
+
+
+def env_pct(name):
+    value = env(name)
+
+    if not value:
         return 0.0
-    value = float(raw)
-    if value < 0 or value > 100:
+
+    result = float(value)
+
+    if not 0 <= result <= 100:
         raise RuntimeError(
             f"{name} must be between 0 and 100"
         )
-    return value
+
+    return result
 
 
 API_KEY = env("BINANCE_API_KEY")
 API_SECRET = env("BINANCE_API_SECRET")
 
-TESTNET = env(
-    "BINANCE_TESTNET", "true"
-).lower() == "true"
-
-LIVE = env(
-    "ENABLE_LIVE_ORDERS", "false"
-).lower() == "true"
+TESTNET = env_bool("BINANCE_TESTNET", True)
+LIVE = env_bool("ENABLE_LIVE_ORDERS", False)
 
 WEBHOOK_SECRET = env("WEBHOOK_SECRET")
+STATUS_SECRET = env("STATUS_SECRET", WEBHOOK_SECRET)
 
-ORDER_MARGIN_USDT = number(
+ORDER_MARGIN_USDT = env_float(
     "ORDER_MARGIN_USDT", 50
 )
 
-ENTRY_LEVERAGE = integer(
+ENTRY_LEVERAGE = env_int(
     "ENTRY_LEVERAGE", 16
 )
 
-INITIAL_SL = percentage(
+INITIAL_SL = env_pct(
     "INITIAL_STOP_LOSS_ROI_PCT"
 )
 
-BREAKEVEN = percentage(
+BREAKEVEN = env_pct(
     "BREAKEVEN_TRIGGER_ROI_PCT"
 )
 
-PARTIAL_TP = percentage(
+PARTIAL_TP = env_pct(
     "PARTIAL_TP_ROI_PCT"
 )
 
-PARTIAL_CLOSE = percentage(
+PARTIAL_CLOSE = env_pct(
     "PARTIAL_CLOSE_PCT"
 )
 
-FINAL_TP = percentage(
+FINAL_TP = env_pct(
     "FINAL_TP_ROI_PCT"
 )
 
-PORTFOLIO_TARGET = number(
+PORTFOLIO_TARGET = env_float(
     "PORTFOLIO_PROFIT_USD", 0
 )
 
 POLL_SECONDS = max(
-    5, integer("POLL_INTERVAL_SECONDS", 5)
+    5, env_int("POLL_INTERVAL_SECONDS", 5)
 )
 
-# Must be a Railway persistent volume path.
+MAX_ALERT_AGE = max(
+    60, env_int("MAX_ALERT_AGE_SECONDS", 180)
+)
+
 DB_PATH = env(
     "BOT_DB_PATH", "/data/maq_bot.sqlite3"
 )
 
-# Prevent an old queued alert from opening a
-# new trade after a prolonged outage.
-MAX_ALERT_AGE_SECONDS = max(
-    60, integer("MAX_ALERT_AGE_SECONDS", 180)
-)
-
-# Poll queue frequently; the webhook does not
-# wait for Binance.
-QUEUE_POLL_SECONDS = 0.5
-
 BOT_PREFIX = "MAQSL"
+
+if not DB_PATH.startswith("/data/"):
+    raise RuntimeError(
+        "BOT_DB_PATH must be under /data/"
+    )
+
+if not os.path.isdir("/data"):
+    raise RuntimeError(
+        "Mount a persistent Railway volume at /data"
+    )
 
 if ORDER_MARGIN_USDT <= 0:
     raise RuntimeError("ORDER_MARGIN_USDT must be positive")
 
-if ENTRY_LEVERAGE < 1 or ENTRY_LEVERAGE > 125:
+if not 1 <= ENTRY_LEVERAGE <= 125:
     raise RuntimeError("Invalid ENTRY_LEVERAGE")
-
-if PARTIAL_TP > 0 and PARTIAL_CLOSE <= 0:
-    raise RuntimeError(
-        "PARTIAL_CLOSE_PCT required for partial TP"
-    )
 
 if LIVE and (not API_KEY or not API_SECRET):
     raise RuntimeError(
@@ -163,39 +162,42 @@ if LIVE and (not API_KEY or not API_SECRET):
 
 if LIVE and not WEBHOOK_SECRET:
     raise RuntimeError(
-        "WEBHOOK_SECRET is required for live orders"
+        "WEBHOOK_SECRET required for live orders"
     )
 
-if not DB_PATH.startswith("/data/"):
+if LIVE and not STATUS_SECRET:
     raise RuntimeError(
-        "BOT_DB_PATH must be inside /data/"
+        "STATUS_SECRET required for live orders"
     )
 
-if not os.path.isdir("/data"):
+if PARTIAL_TP > 0 and PARTIAL_CLOSE <= 0:
     raise RuntimeError(
-        "Mount a persistent Railway volume at /data"
+        "PARTIAL_CLOSE_PCT must be positive"
     )
 
 
 # ============================================================
-# DATABASE
+# SQLITE
 # ============================================================
 
 def db():
-    connection = sqlite3.connect(
+    conn = sqlite3.connect(
         DB_PATH,
         timeout=10,
         isolation_level=None
     )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=10000")
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    return connection
+
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+
+    return conn
 
 
-def init_database():
+def init_db():
     with db() as conn:
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,7 +229,7 @@ def init_database():
         """)
 
 
-init_database()
+init_db()
 
 
 # ============================================================
@@ -240,24 +242,21 @@ client = Client(
     testnet=TESTNET
 )
 
-BASE_URL = (
-    "https://testnet.binancefuture.com"
-    if TESTNET
-    else "https://fapi.binance.com"
-)
-
-symbol_cache = {}
-symbol_cache_time = 0
-symbol_lock = threading.Lock()
 trading_lock = threading.RLock()
+symbol_lock = threading.Lock()
+worker_lock = threading.Lock()
+
+workers_started = False
+symbol_cache = {}
+symbol_cache_time = 0.0
 
 
 # ============================================================
-# SYMBOL HANDLING
+# TRADINGVIEW MESSAGE PARSER
 # ============================================================
 
 def normalize_symbol(raw):
-    symbol = str(raw).upper().strip()
+    symbol = str(raw).strip().upper()
 
     if ":" in symbol:
         symbol = symbol.split(":")[-1]
@@ -277,103 +276,19 @@ def normalize_symbol(raw):
     return symbol
 
 
-def get_symbol_info(symbol):
-    global symbol_cache, symbol_cache_time
-
-    with symbol_lock:
-        if (
-            not symbol_cache
-            or time.time() - symbol_cache_time > 21600
-        ):
-            response = client.futures_exchange_info()
-            symbol_cache = {
-                item["symbol"]: item
-                for item in response["symbols"]
-            }
-            symbol_cache_time = time.time()
-
-    info = symbol_cache.get(symbol)
-
-    if not info or info.get("status") != "TRADING":
-        raise ValueError(
-            f"{symbol} is not an active Binance Futures symbol"
-        )
-
-    return info
-
-
-def get_filter(symbol, filter_type):
-    info = get_symbol_info(symbol)
-
-    for item in info.get("filters", []):
-        if item["filterType"] == filter_type:
-            return item
-
-    raise ValueError(
-        f"Missing {filter_type} for {symbol}"
-    )
-
-
-def step_round(value, step, rounding=ROUND_DOWN):
-    value = Decimal(str(value))
-    step = Decimal(str(step))
-
-    return (
-        (value / step).to_integral_value(
-            rounding=rounding
-        ) * step
-    )
-
-
-def quantity_step(symbol):
-    info = get_symbol_info(symbol)
-
-    for item in info["filters"]:
-        if item["filterType"] == "MARKET_LOT_SIZE":
-            step = float(item.get("stepSize", 0))
-            if step > 0:
-                return step
-
-    return float(
-        get_filter(symbol, "LOT_SIZE")["stepSize"]
-    )
-
-
-def rounded_quantity(symbol, qty):
-    return float(
-        step_round(qty, quantity_step(symbol))
-    )
-
-
-def rounded_stop_price(symbol, price, side):
-    tick = get_filter(
-        symbol, "PRICE_FILTER"
-    )["tickSize"]
-
-    rounding = (
-        ROUND_DOWN if side == "SELL"
-        else ROUND_UP
-    )
-
-    return format(
-        step_round(price, tick, rounding),
-        "f"
-    )
-
-
-# ============================================================
-# ORIGINAL DH ALERT PARSER
-# ============================================================
-
 def parse_message(raw):
     raw = str(raw or "").strip()
 
     if not raw:
         raise ValueError("Empty alert")
 
-    # MAQ format: BUY|BTCUSDT
+    # MAQ alerts:
+    # BUY|BTCUSDT
+    # SELL|BTCUSDT
+
     match = re.fullmatch(
-        r"(BUY|SELL)\s*\|\s*([A-Za-z0-9:._/\-]+)"
+        r"(BUY|SELL)\s*\|\s*"
+        r"([A-Za-z0-9:._/\-]+)"
         r"(?:\|[^\r\n]*)?",
         raw,
         re.IGNORECASE
@@ -385,8 +300,9 @@ def parse_message(raw):
             normalize_symbol(match.group(2))
         )
 
-    # Original DH strategy:
-    # order sell @ 12345 filled on VETUSDT.P.
+    # Original DH strategy order-fill alert:
+    # order sell @ 1000 filled on BINANCE:BTCUSDT.P
+
     match = re.search(
         r"\border\s+(buy|sell)\s+@\s+"
         r"[^\r\n]*?\bfilled\s+on\s+"
@@ -412,41 +328,41 @@ def extract_alert(req):
     data = req.get_json(silent=True)
 
     if isinstance(data, dict):
-        action = data.get("signal") or data.get("action")
+        signal = data.get("signal") or data.get("action")
         symbol = data.get("symbol") or data.get("ticker")
 
-        if action and symbol:
-            action = str(action).upper().strip()
+        if signal and symbol:
+            signal = str(signal).upper().strip()
 
-            if action not in ("BUY", "SELL"):
-                raise ValueError("Invalid action")
+            if signal not in ("BUY", "SELL"):
+                raise ValueError("Invalid signal")
 
             return (
-                action,
+                signal,
                 normalize_symbol(symbol),
                 json.dumps(data, sort_keys=True)
             )
 
         for field in ("message", "text", "alert"):
             if isinstance(data.get(field), str):
-                action, symbol = parse_message(data[field])
-                return action, symbol, data[field]
+                signal, symbol = parse_message(data[field])
+                return signal, symbol, data[field]
 
     if isinstance(data, str):
-        action, symbol = parse_message(data)
-        return action, symbol, data
+        signal, symbol = parse_message(data)
+        return signal, symbol, data
 
     raw = req.get_data(as_text=True)
-    action, symbol = parse_message(raw)
-    return action, symbol, raw
+    signal, symbol = parse_message(raw)
+    return signal, symbol, raw
 
 
 # ============================================================
-# WEBHOOK AUTHENTICATION
+# AUTHENTICATION
 # ============================================================
 
-def authenticated(req):
-    if not WEBHOOK_SECRET:
+def secret_matches(req, secret):
+    if not secret:
         return not LIVE
 
     supplied = (
@@ -454,20 +370,16 @@ def authenticated(req):
         or req.headers.get("X-Webhook-Secret", "")
     )
 
-    return hmac.compare_digest(
-        supplied,
-        WEBHOOK_SECRET
-    )
+    return hmac.compare_digest(supplied, secret)
 
 
 # ============================================================
-# FAST PERSISTENT WEBHOOK
+# FAST WEBHOOK
 # ============================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
-    if not authenticated(request):
+    if not secret_matches(request, WEBHOOK_SECRET):
         return jsonify({
             "status": "rejected",
             "error": "Invalid webhook secret"
@@ -476,54 +388,37 @@ def webhook():
     try:
         signal, symbol, raw = extract_alert(request)
 
-        # Identical messages within the same 15-minute
-        # bucket are treated as duplicates.
-        #
-        # If TradingView emits multiple legitimate
-        # identical fills in one bucket, a unique alert
-        # identifier should be added to the payload.
-        bucket = int(time.time() // 900)
+        now = time.time()
+        bucket = int(now // 900)
 
         fingerprint = hashlib.sha256(
             f"{bucket}|{signal}|{symbol}|{raw}".encode()
         ).hexdigest()
 
-        now = time.time()
-
         with db() as conn:
             cursor = conn.execute("""
                 INSERT OR IGNORE INTO alerts (
-                    fingerprint,
-                    symbol,
-                    signal,
-                    raw_message,
-                    received_at,
-                    status,
-                    updated_at
+                    fingerprint, symbol, signal,
+                    raw_message, received_at,
+                    status, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, 'pending', ?)
             """, (
-                fingerprint,
-                symbol,
-                signal,
-                raw,
-                now,
-                now
+                fingerprint, symbol, signal,
+                raw, now, now
             ))
 
             inserted = cursor.rowcount == 1
 
         log.info(
-            "WEBHOOK %s %s status=%s",
+            "Alert %s %s: %s",
             signal,
             symbol,
             "queued" if inserted else "duplicate"
         )
 
         return jsonify({
-            "status": (
-                "queued" if inserted else "duplicate"
-            ),
+            "status": "queued" if inserted else "duplicate",
             "signal": signal,
             "symbol": symbol
         }), 200
@@ -535,22 +430,125 @@ def webhook():
         }), 400
 
     except Exception:
-        log.exception("Webhook queue failure")
-
+        log.exception("Webhook storage failure")
         return jsonify({
             "status": "error",
-            "error": "Alert could not be saved"
+            "error": "Could not save alert"
         }), 503
 
 
 # ============================================================
-# POSITION HELPERS
+# EXCHANGE INFORMATION
 # ============================================================
 
-def positions_for_symbol(symbol):
+def get_symbol_info(symbol):
+    global symbol_cache, symbol_cache_time
+
+    with symbol_lock:
+        if (
+            not symbol_cache
+            or time.time() - symbol_cache_time > 21600
+        ):
+            info = client.futures_exchange_info()
+
+            symbol_cache = {
+                item["symbol"]: item
+                for item in info["symbols"]
+            }
+
+            symbol_cache_time = time.time()
+
+    result = symbol_cache.get(symbol)
+
+    if not result or result.get("status") != "TRADING":
+        raise ValueError(
+            f"Unavailable Futures symbol: {symbol}"
+        )
+
+    return result
+
+
+def symbol_filter(symbol, filter_type):
+    info = get_symbol_info(symbol)
+
+    for item in info["filters"]:
+        if item["filterType"] == filter_type:
+            return item
+
+    raise ValueError(f"Missing {filter_type}")
+
+
+def round_step(value, step):
+    value = Decimal(str(value))
+    step = Decimal(str(step))
+
+    return (
+        (value / step).to_integral_value(
+            rounding=ROUND_DOWN
+        ) * step
+    )
+
+
+def quantity_step(symbol):
+    info = get_symbol_info(symbol)
+
+    for item in info["filters"]:
+        if item["filterType"] == "MARKET_LOT_SIZE":
+            step = float(item.get("stepSize", 0))
+
+            if step > 0:
+                return step
+
+    return float(
+        symbol_filter(symbol, "LOT_SIZE")["stepSize"]
+    )
+
+
+def round_qty(symbol, quantity):
+    return float(
+        round_step(quantity, quantity_step(symbol))
+    )
+
+
+# ============================================================
+# POSITIONS
+# ============================================================
+
+def assert_one_way():
+    mode = client.futures_get_position_mode()
+
+    if mode.get("dualSidePosition"):
+        raise RuntimeError(
+            "Binance Hedge Mode is unsupported"
+        )
+
+
+def current_position(symbol):
     positions = client.futures_position_information(
         symbol=symbol
     )
+
+    active = [
+        p for p in positions
+        if abs(float(p["positionAmt"])) > 0
+    ]
+
+    if len(active) > 1:
+        raise RuntimeError(
+            "Multiple position sides detected"
+        )
+
+    if active:
+        if active[0].get("positionSide", "BOTH") != "BOTH":
+            raise RuntimeError("Hedge Mode unsupported")
+
+        return active[0]
+
+    return None
+
+
+def all_positions():
+    positions = client.futures_position_information()
 
     return [
         p for p in positions
@@ -558,48 +556,10 @@ def positions_for_symbol(symbol):
     ]
 
 
-def current_position(symbol):
-    positions = positions_for_symbol(symbol)
-
-    if len(positions) > 1:
-        raise RuntimeError(
-            "Multiple position sides detected"
-        )
-
-    if positions:
-        p = positions[0]
-
-        if p.get("positionSide", "BOTH") != "BOTH":
-            raise RuntimeError(
-                "Hedge Mode is not supported"
-            )
-
-        return p
-
-    return None
-
-
-def assert_one_way_mode():
-    result = client.futures_get_position_mode()
-
-    if result.get("dualSidePosition"):
-        raise RuntimeError(
-            "Disable Binance Hedge Mode before using this bot"
-        )
-
-
-def get_price(symbol):
-    return float(
-        client.futures_symbol_ticker(
-            symbol=symbol
-        )["price"]
-    )
-
-
-def roi_pct(position):
-    amount = float(position["positionAmt"])
+def position_roi(position):
     entry = float(position["entryPrice"])
     mark = float(position.get("markPrice", 0) or 0)
+    amount = float(position["positionAmt"])
     leverage = float(position.get("leverage", 1) or 1)
 
     if entry <= 0 or mark <= 0:
@@ -613,7 +573,11 @@ def roi_pct(position):
     return change * leverage * 100
 
 
-def state_for(position):
+# ============================================================
+# PERSISTENT POSITION STATE
+# ============================================================
+
+def position_state(position):
     symbol = position["symbol"]
     entry = float(position["entryPrice"])
     qty = abs(float(position["positionAmt"]))
@@ -624,15 +588,18 @@ def state_for(position):
             (symbol,)
         ).fetchone()
 
-        if row is None or abs(
-            float(row["entry_price"]) - entry
-        ) > max(entry * 0.000001, 1e-12):
-
+        if (
+            row is None
+            or abs(float(row["entry_price"]) - entry)
+            > max(entry * 0.000001, 1e-12)
+        ):
             conn.execute("""
                 INSERT OR REPLACE INTO position_state
-                (symbol, entry_price, entry_qty,
-                 partial_done, breakeven_done,
-                 initial_stop_done)
+                (
+                    symbol, entry_price, entry_qty,
+                    partial_done, breakeven_done,
+                    initial_stop_done
+                )
                 VALUES (?, ?, ?, 0, 0, 0)
             """, (symbol, entry, qty))
 
@@ -663,20 +630,32 @@ def update_state(symbol, **fields):
             )
 
 
+def delete_state(symbol):
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM position_state WHERE symbol=?",
+            (symbol,)
+        )
+
+
 # ============================================================
-# BINANCE MARKET ORDERS
+# MARKET ORDERS
 # ============================================================
 
 def market_order(symbol, side, quantity, reduce_only=False):
+    quantity = round_qty(symbol, quantity)
+
+    if quantity <= 0:
+        raise RuntimeError(
+            f"Quantity too small for {symbol}"
+        )
+
     params = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "quantity": rounded_quantity(symbol, quantity)
+        "quantity": quantity
     }
-
-    if params["quantity"] <= 0:
-        raise ValueError("Quantity rounds to zero")
 
     if reduce_only:
         params["reduceOnly"] = True
@@ -690,7 +669,7 @@ def close_position(position, fraction=1.0):
     if amount == 0:
         return None
 
-    side = SIDE_SELL if amount > 0 else SIDE_BUY
+    side = "SELL" if amount > 0 else "BUY"
 
     return market_order(
         position["symbol"],
@@ -700,166 +679,36 @@ def close_position(position, fraction=1.0):
     )
 
 
-def wait_for_position(symbol, expected_direction=None):
-    for _ in range(20):
+def wait_for_position(symbol, direction=None, timeout=10):
+    start = time.time()
+
+    while time.time() - start < timeout:
         p = current_position(symbol)
 
-        if expected_direction is None:
+        if direction is None:
             if p is None:
                 return None
-        elif p is not None:
+
+        elif p:
             amount = float(p["positionAmt"])
 
             if (
-                expected_direction == "BUY" and amount > 0
+                direction == "BUY" and amount > 0
             ) or (
-                expected_direction == "SELL" and amount < 0
+                direction == "SELL" and amount < 0
             ):
                 return p
 
         time.sleep(0.5)
 
     raise RuntimeError(
-        f"Position confirmation timed out: {symbol}"
+        f"Position confirmation timeout: {symbol}"
     )
 
 
 # ============================================================
-# BINANCE CONDITIONAL STOP API
+# STOP ORDERS
 # ============================================================
-
-def algo_request(method, path, params=None):
-    params = dict(params or {})
-
-    params["timestamp"] = int(time.time() * 1000)
-    params["recvWindow"] = 5000
-
-    query = urllib.parse.urlencode(params)
-
-    signature = hmac.new(
-        API_SECRET.encode(),
-        query.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    payload = query + "&signature=" + signature
-
-    headers = {
-        "X-MBX-APIKEY": API_KEY,
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-
-    method = method.upper()
-
-    if method == "POST":
-        req = urllib.request.Request(
-            BASE_URL + path,
-            data=payload.encode(),
-            headers=headers,
-            method=method
-        )
-    else:
-        req = urllib.request.Request(
-            BASE_URL + path + "?" + payload,
-            headers=headers,
-            method=method
-        )
-
-    try:
-        with urllib.request.urlopen(
-            req, timeout=15
-        ) as response:
-            body = response.read().decode()
-            return json.loads(body) if body else {}
-
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")
-        raise RuntimeError(
-            f"Binance Algo API {exc.code}: {body}"
-        ) from exc
-
-
-def open_bot_stops(symbol):
-    response = algo_request(
-        "GET",
-        "/fapi/v1/openAlgoOrders",
-        {
-            "symbol": symbol,
-            "algoType": "CONDITIONAL"
-        }
-    )
-
-    return [
-        o for o in response
-        if str(
-            o.get("clientAlgoId", "")
-        ).startswith(BOT_PREFIX)
-    ]
-
-
-def cancel_bot_stops(symbol):
-    for order in open_bot_stops(symbol):
-        algo_request(
-            "DELETE",
-            "/fapi/v1/algoOrder",
-            {
-                "symbol": symbol,
-                "algoId": order["algoId"]
-            }
-        )
-
-
-def place_stop(position, stop_price, reason):
-    symbol = position["symbol"]
-    amount = float(position["positionAmt"])
-
-    side = "SELL" if amount > 0 else "BUY"
-
-    price = rounded_stop_price(
-        symbol, stop_price, side
-    )
-
-    client_id = (
-        f"{BOT_PREFIX}{reason[:2]}"
-        f"{int(time.time() * 1000)}"
-    )
-
-    result = algo_request(
-        "POST",
-        "/fapi/v1/algoOrder",
-        {
-            "algoType": "CONDITIONAL",
-            "symbol": symbol,
-            "side": side,
-            "type": "STOP_MARKET",
-            "triggerPrice": price,
-            "workingType": "MARK_PRICE",
-            "closePosition": "true",
-            "clientAlgoId": client_id
-        }
-    )
-
-    # Only cancel older stops after the new
-    # protective order was accepted.
-    for order in open_bot_stops(symbol):
-        if order.get("clientAlgoId") != client_id:
-            try:
-                algo_request(
-                    "DELETE",
-                    "/fapi/v1/algoOrder",
-                    {
-                        "symbol": symbol,
-                        "algoId": order["algoId"]
-                    }
-                )
-            except Exception:
-                log.exception(
-                    "Could not cancel older stop for %s",
-                    symbol
-                )
-
-    return result
-
 
 def initial_stop_price(position):
     entry = float(position["entryPrice"])
@@ -868,21 +717,19 @@ def initial_stop_price(position):
 
     fraction = INITIAL_SL / 100 / leverage
 
-    return (
-        entry * (1 - fraction)
-        if amount > 0
-        else entry * (1 + fraction)
-    )
+    if amount > 0:
+        return entry * (1 - fraction)
+
+    return entry * (1 + fraction)
 
 
 # ============================================================
-# ENTRY / REVERSAL
+# ENTRY AND REVERSAL
 # ============================================================
 
 def execute_signal(signal, symbol):
     with trading_lock:
-
-        assert_one_way_mode()
+        assert_one_way()
         get_symbol_info(symbol)
 
         current = current_position(symbol)
@@ -894,59 +741,51 @@ def execute_signal(signal, symbol):
             if direction == signal:
                 return "already_in_position"
 
-            # Stop orders are canceled only after
-            # confirming that the position is closed.
             close_position(current)
             wait_for_position(symbol, None)
-            cancel_bot_stops(symbol)
-
-            with db() as conn:
-                conn.execute(
-                    "DELETE FROM position_state WHERE symbol=?",
-                    (symbol,)
-                )
+            delete_state(symbol)
 
         client.futures_change_leverage(
             symbol=symbol,
             leverage=ENTRY_LEVERAGE
         )
 
-        price = get_price(symbol)
-        qty = (
+        price = float(
+            client.futures_symbol_ticker(
+                symbol=symbol
+            )["price"]
+        )
+
+        quantity = (
             ORDER_MARGIN_USDT * ENTRY_LEVERAGE
         ) / price
 
-        side = (
-            SIDE_BUY if signal == "BUY"
-            else SIDE_SELL
+        order = market_order(
+            symbol,
+            signal,
+            quantity
         )
 
-        order = market_order(symbol, side, qty)
-
         log.warning(
-            "ENTRY ORDER %s %s ID=%s",
+            "Entry %s %s order=%s",
             signal,
             symbol,
             order.get("orderId")
         )
 
         position = wait_for_position(symbol, signal)
-        state_for(position)
+        position_state(position)
 
         if INITIAL_SL > 0:
-            place_stop(
-                position,
-                initial_stop_price(position),
-                "INITIAL"
-            )
-
+            # Software-managed initial stop.
+            # Checked by the risk monitor.
             update_state(
-                symbol, initial_stop_done=True
+                symbol,
+                initial_stop_done=True
             )
-
         else:
-            log.warning(
-                "%s initial stop loss DISABLED",
+            log.info(
+                "%s initial stop disabled",
                 symbol
             )
 
@@ -954,7 +793,7 @@ def execute_signal(signal, symbol):
 
 
 # ============================================================
-# QUEUE PROCESSOR
+# QUEUE
 # ============================================================
 
 def claim_alert():
@@ -964,8 +803,7 @@ def claim_alert():
         row = conn.execute("""
             SELECT * FROM alerts
             WHERE status='pending'
-            ORDER BY id
-            LIMIT 1
+            ORDER BY id LIMIT 1
         """).fetchone()
 
         if row:
@@ -973,11 +811,10 @@ def claim_alert():
                 UPDATE alerts
                 SET status='processing',
                     updated_at=?
-                WHERE id=? AND status='pending'
+                WHERE id=?
             """, (time.time(), row["id"]))
 
         conn.commit()
-
         return dict(row) if row else None
 
 
@@ -988,32 +825,28 @@ def set_alert_status(alert_id, status, error=None):
             SET status=?, error=?, updated_at=?
             WHERE id=?
         """, (
-            status,
-            error,
-            time.time(),
-            alert_id
+            status, error, time.time(), alert_id
         ))
 
 
 def queue_worker():
-    log.info("Persistent queue worker started")
+    log.info("MAQ queue worker started")
 
     while True:
         try:
             alert = claim_alert()
 
             if not alert:
-                time.sleep(QUEUE_POLL_SECONDS)
+                time.sleep(0.5)
                 continue
 
             alert_id = alert["id"]
-            age = time.time() - alert["received_at"]
 
-            if age > MAX_ALERT_AGE_SECONDS:
+            if time.time() - alert["received_at"] > MAX_ALERT_AGE:
                 set_alert_status(
                     alert_id,
                     "expired",
-                    "Alert too old to execute"
+                    "Alert too old"
                 )
                 continue
 
@@ -1024,9 +857,7 @@ def queue_worker():
                     alert["symbol"]
                 )
 
-                set_alert_status(
-                    alert_id, "dry_run"
-                )
+                set_alert_status(alert_id, "dry_run")
                 continue
 
             try:
@@ -1035,16 +866,11 @@ def queue_worker():
                     alert["symbol"]
                 )
 
-                set_alert_status(
-                    alert_id, result
-                )
+                set_alert_status(alert_id, result)
 
             except Exception as exc:
-                # Binance may have accepted an order
-                # before a network timeout occurred.
-                # Do NOT blindly retry.
                 log.exception(
-                    "Alert %s requires review",
+                    "Alert %s needs review",
                     alert_id
                 )
 
@@ -1055,7 +881,7 @@ def queue_worker():
                 )
 
         except Exception:
-            log.exception("Queue worker error")
+            log.exception("Queue worker failure")
             time.sleep(2)
 
 
@@ -1068,71 +894,69 @@ def monitor_positions():
         return
 
     with trading_lock:
-        assert_one_way_mode()
+        assert_one_way()
 
-        positions = client.futures_position_information()
-        active = [
-            p for p in positions
-            if abs(float(p["positionAmt"])) > 0
-        ]
+        positions = all_positions()
 
         total_profit = sum(
             float(p.get("unRealizedProfit", 0) or 0)
-            for p in active
+            for p in positions
         )
 
         if (
             PORTFOLIO_TARGET > 0
             and total_profit >= PORTFOLIO_TARGET
         ):
-            log.warning(
-                "PORTFOLIO TARGET REACHED %.2f",
-                total_profit
-            )
-
-            for p in active:
+            for p in positions:
                 close_position(p)
                 wait_for_position(p["symbol"], None)
-                cancel_bot_stops(p["symbol"])
+                delete_state(p["symbol"])
 
             return
 
-        for p in active:
+        for p in positions:
             symbol = p["symbol"]
-            roi = roi_pct(p)
-            state = state_for(p)
+            roi = position_roi(p)
+            state = position_state(p)
 
-            # Initial stop disabled when empty.
+            # Initial stop-loss, disabled when empty.
             if INITIAL_SL > 0 and roi <= -INITIAL_SL:
                 close_position(p)
                 wait_for_position(symbol, None)
-                cancel_bot_stops(symbol)
+                delete_state(symbol)
                 continue
 
-            # Final take profit.
+            # Final take-profit.
             if FINAL_TP > 0 and roi >= FINAL_TP:
                 close_position(p)
                 wait_for_position(symbol, None)
-                cancel_bot_stops(symbol)
+                delete_state(symbol)
                 continue
 
-            # Breakeven stop.
+            # Breakeven:
+            # Software-managed exit at ROI <= 0
+            # after the trigger has been reached.
             if (
                 BREAKEVEN > 0
                 and roi >= BREAKEVEN
                 and not state["breakeven_done"]
             ):
-                place_stop(
-                    p,
-                    float(p["entryPrice"]),
-                    "BREAKEVEN"
-                )
-
                 update_state(
-                    symbol, breakeven_done=True
+                    symbol,
+                    breakeven_done=True
                 )
+                state["breakeven_done"] = 1
 
-            # Partial take profit.
+            if (
+                state["breakeven_done"]
+                and roi <= 0
+            ):
+                close_position(p)
+                wait_for_position(symbol, None)
+                delete_state(symbol)
+                continue
+
+            # Partial take-profit.
             if (
                 PARTIAL_TP > 0
                 and PARTIAL_CLOSE > 0
@@ -1140,72 +964,44 @@ def monitor_positions():
                 and not state["partial_done"]
             ):
                 result = close_position(
-                    p, PARTIAL_CLOSE / 100
+                    p,
+                    PARTIAL_CLOSE / 100
                 )
 
                 if result:
                     update_state(
-                        symbol, partial_done=True
+                        symbol,
+                        partial_done=True
                     )
 
-                    # Breakeven after partial TP
-                    # only when the BE variable is on.
                     if BREAKEVEN > 0:
-                        remaining = current_position(
-                            symbol
+                        update_state(
+                            symbol,
+                            breakeven_done=True
                         )
-
-                        if remaining:
-                            place_stop(
-                                remaining,
-                                float(remaining["entryPrice"]),
-                                "BREAKEVEN"
-                            )
-
-                            update_state(
-                                symbol,
-                                breakeven_done=True
-                            )
-
-            # Initial stop rearm only when enabled.
-            if (
-                INITIAL_SL > 0
-                and not state["initial_stop_done"]
-                and not state["breakeven_done"]
-            ):
-                place_stop(
-                    p,
-                    initial_stop_price(p),
-                    "INITIAL"
-                )
-
-                update_state(
-                    symbol,
-                    initial_stop_done=True
-                )
 
 
 def risk_worker():
-    log.info("Risk monitor started")
+    log.info("MAQ risk monitor started")
 
     while True:
         try:
             monitor_positions()
         except Exception:
-            log.exception("Risk monitor error")
+            log.exception("Risk monitor failure")
 
         time.sleep(POLL_SECONDS)
 
 
 # ============================================================
-# HEALTH / STATUS
+# ROUTES
 # ============================================================
 
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "service": "MAQ DH V4",
+        "service": "MAQ DH V6",
         "testnet": TESTNET,
         "live_orders": LIVE
     })
@@ -1213,28 +1009,31 @@ def health():
 
 @app.route("/status", methods=["GET"])
 def status():
+    if not secret_matches(request, STATUS_SECRET):
+        return jsonify({
+            "error": "Unauthorized"
+        }), 401
+
     with db() as conn:
-        rows = conn.execute("""
+        counts = conn.execute("""
             SELECT status, COUNT(*) AS count
-            FROM alerts
-            GROUP BY status
+            FROM alerts GROUP BY status
         """).fetchall()
 
         recent = conn.execute("""
             SELECT id, symbol, signal, status,
                    error, received_at
             FROM alerts
-            ORDER BY id DESC
-            LIMIT 20
+            ORDER BY id DESC LIMIT 20
         """).fetchall()
 
     return jsonify({
-        "service": "MAQ DH V4",
+        "service": "MAQ DH V6",
         "testnet": TESTNET,
         "live_orders": LIVE,
         "queue": {
             row["status"]: row["count"]
-            for row in rows
+            for row in counts
         },
         "recent_alerts": [
             dict(row) for row in recent
@@ -1253,34 +1052,36 @@ def status():
 
 
 # ============================================================
-# START BACKGROUND WORKERS
+# START WORKERS
 # ============================================================
 
 def start_workers():
-    # Processing alerts from a previous deployment is
-    # intentionally NOT resumed automatically if they
-    # were already marked 'processing'.
-    #
-    # Review these through /status before taking action.
+    global workers_started
 
-    threading.Thread(
-        target=queue_worker,
-        daemon=True,
-        name="MAQ-Queue"
-    ).start()
+    with worker_lock:
+        if workers_started:
+            return
 
-    threading.Thread(
-        target=risk_worker,
-        daemon=True,
-        name="MAQ-Risk"
-    ).start()
+        workers_started = True
+
+        threading.Thread(
+            target=queue_worker,
+            daemon=True,
+            name="MAQ-Queue"
+        ).start()
+
+        threading.Thread(
+            target=risk_worker,
+            daemon=True,
+            name="MAQ-Risk"
+        ).start()
 
 
 start_workers()
 
 
 if __name__ == "__main__":
-    port = int(env("PORT", "8080"))
+    port = env_int("PORT", 8080)
 
     app.run(
         host="0.0.0.0",
