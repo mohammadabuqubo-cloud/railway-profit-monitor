@@ -15,7 +15,7 @@ from binance.client import Client
 
 
 # =====================================================
-# MAQ DH V8
+# MAQ DH V8 + VWAP V1
 # Railway + TradingView + Binance USD-M Futures
 # =====================================================
 
@@ -42,7 +42,6 @@ def flag(name, default=False):
         name,
         "true" if default else "false"
     ).lower()
-
     return value in ("true", "1", "yes", "on")
 
 
@@ -64,10 +63,12 @@ LEVERAGE = int(number("ENTRY_LEVERAGE", 16))
 
 INITIAL_SL = number("INITIAL_STOP_LOSS_ROI_PCT", 0)
 BREAKEVEN = number("BREAKEVEN_TRIGGER_ROI_PCT", 0)
+BE_STOP = number("BREAKEVEN_STOP_ROI_PCT", 0)
+
+VWAP_ENABLED = flag("VWAP_ENABLED", False)
 
 PARTIAL_TP = number("PARTIAL_TP_ROI_PCT", 0)
 PARTIAL_CLOSE = number("PARTIAL_CLOSE_PCT", 50)
-
 FINAL_TP = number("FINAL_TP_ROI_PCT", 0)
 PORTFOLIO_TARGET = number("PORTFOLIO_PROFIT_USD", 0)
 
@@ -122,10 +123,8 @@ def database():
     )
 
     conn.row_factory = sqlite3.Row
-
     conn.execute("PRAGMA busy_timeout=20000")
     conn.execute("PRAGMA journal_mode=WAL")
-
     return conn
 
 
@@ -164,7 +163,35 @@ def initialize_database():
             )
         """)
 
-        # An interrupted trade must not be blindly replayed.
+        columns = {
+            r[1] for r in conn.execute(
+                "PRAGMA table_info(bot_positions)"
+            )
+        }
+
+        if "strategy" not in columns:
+            conn.execute(
+                "ALTER TABLE bot_positions "
+                "ADD COLUMN strategy TEXT DEFAULT 'DH'"
+            )
+
+        columns = {
+            r[1] for r in conn.execute(
+                "PRAGMA table_info(position_state)"
+            )
+        }
+
+        if "tp_count" not in columns:
+            conn.execute(
+                "ALTER TABLE position_state "
+                "ADD COLUMN tp_count INTEGER DEFAULT 0"
+            )
+
+        conn.execute(
+            "UPDATE bot_positions SET strategy='DH' "
+            "WHERE strategy IS NULL"
+        )
+
         conn.execute("""
             UPDATE alerts
             SET status='needs_review',
@@ -191,7 +218,6 @@ def client():
                 API_SECRET,
                 testnet=TESTNET
             )
-
         return _client
 
 
@@ -222,6 +248,19 @@ def normalize_symbol(raw):
 
 def parse_message(message):
     message = str(message).strip()
+
+    vwap = re.fullmatch(
+        r"VWAP\|(BUY|SELL|TP[1-5]|CLOSE)"
+        r"\|([A-Za-z0-9:._/\-]+)",
+        message,
+        re.IGNORECASE
+    )
+
+    if vwap:
+        return (
+            "VWAP_" + vwap.group(1).upper(),
+            normalize_symbol(vwap.group(2))
+        )
 
     legacy = re.fullmatch(
         r"(BUY|SELL)\s*\|\s*"
@@ -264,7 +303,15 @@ def extract_alert():
         if signal and symbol:
             signal = str(signal).upper().strip()
 
-            if signal not in ("BUY", "SELL"):
+            valid = (
+                "BUY", "SELL",
+                "VWAP_BUY", "VWAP_SELL",
+                "VWAP_TP1", "VWAP_TP2",
+                "VWAP_TP3", "VWAP_TP4",
+                "VWAP_TP5", "VWAP_CLOSE"
+            )
+
+            if signal not in valid:
                 raise ValueError("Invalid signal")
 
             return (
@@ -276,7 +323,6 @@ def extract_alert():
         for key in ("message", "text", "alert"):
             if isinstance(data.get(key), str):
                 signal, symbol = parse_message(data[key])
-
                 return signal, symbol, data[key]
 
     raw = (
@@ -285,7 +331,6 @@ def extract_alert():
     )
 
     signal, symbol = parse_message(raw)
-
     return signal, symbol, raw
 
 
@@ -295,10 +340,6 @@ def extract_alert():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
-    # Optional authentication.
-    # Leaving WEBHOOK_SECRET empty preserves old alerts,
-    # but makes the endpoint unauthenticated.
 
     if WEBHOOK_SECRET:
         supplied = (
@@ -310,17 +351,12 @@ def webhook():
             supplied,
             WEBHOOK_SECRET
         ):
-            return jsonify(
-                error="Unauthorized"
-            ), 403
+            return jsonify(error="Unauthorized"), 403
 
     try:
         signal, symbol, raw = extract_alert()
-
         now = time.time()
 
-        # Duplicate suppression for identical alerts
-        # within a 15-minute window.
         bucket = int(now // 900)
 
         fingerprint = hashlib.sha256(
@@ -387,16 +423,27 @@ def owned(symbol):
         return row is not None
 
 
-def save_owned(symbol, direction):
+def owned_strategy(symbol):
+    with DB_LOCK, database() as conn:
+        row = conn.execute(
+            "SELECT strategy FROM bot_positions WHERE symbol=?",
+            (symbol,)
+        ).fetchone()
+
+        return row["strategy"] if row else None
+
+
+def save_owned(symbol, direction, strategy="DH"):
     with DB_LOCK, database() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO bot_positions
-            (symbol, direction, created_at)
-            VALUES (?, ?, ?)
+            (symbol, direction, created_at, strategy)
+            VALUES (?, ?, ?, ?)
         """, (
             symbol,
             direction,
-            time.time()
+            time.time(),
+            strategy
         ))
 
 
@@ -463,17 +510,20 @@ def quantity_step(symbol):
         ):
             for item_filter in item["filters"]:
                 if item_filter["filterType"] == filter_type:
-                    step = Decimal(item_filter["stepSize"])
+                    step = Decimal(
+                        item_filter["stepSize"]
+                    )
 
                     if step > 0:
                         return step
 
-    raise RuntimeError("Symbol quantity step unavailable")
+    raise RuntimeError(
+        "Symbol quantity step unavailable"
+    )
 
 
 def rounded_quantity(symbol, quantity):
     step = quantity_step(symbol)
-
     quantity = Decimal(str(quantity))
 
     return float(
@@ -589,7 +639,11 @@ def position_state(position):
             float(row["entry_price"]) - entry
         ) > max(entry * 0.000001, 1e-12):
             raise RuntimeError(
-                "Entry price changed; manual review required"
+                f"{symbol}: entry price mismatch "
+                f"saved={row['entry_price']} "
+                f"Binance={entry}; "
+                "position quarantined pending "
+                "manual reconciliation"
             )
 
         return dict(row)
@@ -638,7 +692,7 @@ def calculate_roi(position):
 # EXECUTE SIGNAL
 # =====================================================
 
-def execute_signal(signal, symbol):
+def execute_signal(signal, symbol, strategy="DH"):
 
     with TRADE_LOCK:
 
@@ -650,6 +704,13 @@ def execute_signal(signal, symbol):
             )
 
         existing = current_position(symbol)
+
+        if existing and owned_strategy(symbol) != strategy:
+            raise RuntimeError(
+                f"{symbol}: position belongs to "
+                f"{owned_strategy(symbol) or 'manual'}, "
+                f"not {strategy}; refusing to modify"
+            )
 
         if existing:
             if not owned(symbol):
@@ -681,7 +742,6 @@ def execute_signal(signal, symbol):
         )
 
         price = float(ticker["price"])
-
         quantity = MARGIN * LEVERAGE / price
 
         result = market_order(
@@ -699,10 +759,117 @@ def execute_signal(signal, symbol):
 
         position = wait_position(symbol, signal)
 
-        save_owned(symbol, signal)
+        save_owned(symbol, signal, strategy)
         position_state(position)
 
         return "executed"
+
+
+# =====================================================
+# VWAP EXIT ENGINE
+# =====================================================
+
+def execute_vwap(signal, symbol):
+    if not VWAP_ENABLED:
+        raise RuntimeError("VWAP_ENABLED is false")
+
+    if signal in ("BUY", "SELL"):
+        return execute_signal(
+            signal,
+            symbol,
+            strategy="VWAP"
+        )
+
+    with TRADE_LOCK:
+        if owned_strategy(symbol) != "VWAP":
+            raise RuntimeError(
+                f"{symbol}: no VWAP-owned position; "
+                "refusing exit"
+            )
+
+        position = current_position(symbol)
+
+        if not position:
+            remove_owned(symbol)
+            return "already_flat"
+
+        state = position_state(position)
+
+        if signal == "CLOSE":
+            close_position(position)
+            wait_position(symbol)
+            remove_owned(symbol)
+            return "vwap_closed"
+
+        target = int(signal[2:])
+        count = int(state["tp_count"])
+
+        if target <= count:
+            return "tp_already_processed"
+
+        if target != count + 1:
+            raise RuntimeError(
+                f"{symbol}: out-of-order TP{target}, "
+                f"expected TP{count+1}"
+            )
+
+        if target == 5:
+            close_position(position)
+            wait_position(symbol)
+            remove_owned(symbol)
+            return "vwap_tp5_closed"
+
+        original = float(state["entry_qty"])
+        remaining = abs(float(position["positionAmt"]))
+
+        qty = min(
+            remaining,
+            rounded_quantity(
+                symbol,
+                original * 0.20
+            )
+        )
+
+        if qty <= 0:
+            raise RuntimeError(
+                f"{symbol}: TP{target} "
+                "below Binance lot step"
+            )
+
+        side = (
+            "SELL"
+            if float(position["positionAmt"]) > 0
+            else "BUY"
+        )
+
+        market_order(
+            symbol,
+            side,
+            qty,
+            reduce_only=True
+        )
+
+        updated = current_position(symbol)
+
+        if updated and abs(
+            float(updated["positionAmt"])
+        ) >= remaining:
+            raise RuntimeError(
+                f"{symbol}: TP{target} not confirmed; "
+                "manual review"
+            )
+
+        with DB_LOCK, database() as conn:
+            conn.execute(
+                "UPDATE position_state "
+                "SET tp_count=? WHERE symbol=?",
+                (target, symbol)
+            )
+
+        if not updated:
+            remove_owned(symbol)
+
+        return f"vwap_tp{target}_executed"
 
 
 # =====================================================
@@ -734,7 +901,6 @@ def claim_alert():
             ))
 
         conn.commit()
-
         return dict(row) if row else None
 
 
@@ -794,10 +960,18 @@ def queue_worker():
                 continue
 
             try:
-                result = execute_signal(
-                    alert["signal"],
-                    alert["symbol"]
-                )
+                signal = alert["signal"]
+
+                if signal.startswith("VWAP_"):
+                    result = execute_vwap(
+                        signal[5:],
+                        alert["symbol"]
+                    )
+                else:
+                    result = execute_signal(
+                        signal,
+                        alert["symbol"]
+                    )
 
                 finish_alert(
                     alert["id"],
@@ -858,71 +1032,106 @@ def monitor_risk():
         for position in active:
             symbol = position["symbol"]
 
-            value = calculate_roi(position)
-            state = position_state(position)
+            try:
+                value = calculate_roi(position)
+                state = position_state(position)
+                strategy = owned_strategy(symbol)
 
-            # Initial stop loss disabled when blank or zero.
-            if (
-                INITIAL_SL > 0
-                and value <= -INITIAL_SL
-            ):
-                close_position(position)
-                wait_position(symbol)
-                remove_owned(symbol)
-                continue
+                if (
+                    INITIAL_SL > 0
+                    and value <= -INITIAL_SL
+                ):
+                    close_position(position)
+                    wait_position(symbol)
+                    remove_owned(symbol)
 
-            if (
-                FINAL_TP > 0
-                and value >= FINAL_TP
-            ):
-                close_position(position)
-                wait_position(symbol)
-                remove_owned(symbol)
-                continue
+                    log.warning(
+                        "INITIAL STOP EXECUTED "
+                        "%s ROI=%.3f",
+                        symbol,
+                        value
+                    )
+                    continue
 
-            if (
-                BREAKEVEN > 0
-                and value >= BREAKEVEN
-                and not state["breakeven_done"]
-            ):
-                mark_state(
-                    symbol,
-                    "breakeven_done"
-                )
-
-                state["breakeven_done"] = 1
-
-            if (
-                state["breakeven_done"]
-                and value <= 0
-            ):
-                close_position(position)
-                wait_position(symbol)
-                remove_owned(symbol)
-                continue
-
-            if (
-                PARTIAL_TP > 0
-                and PARTIAL_CLOSE > 0
-                and value >= PARTIAL_TP
-                and not state["partial_done"]
-            ):
-                result = close_position(
-                    position,
-                    PARTIAL_CLOSE / 100
-                )
-
-                if result:
+                if (
+                    BREAKEVEN > 0
+                    and value >= BREAKEVEN
+                    and not state["breakeven_done"]
+                ):
                     mark_state(
                         symbol,
-                        "partial_done"
+                        "breakeven_done"
                     )
 
-                    if BREAKEVEN > 0:
+                    state["breakeven_done"] = 1
+
+                    log.warning(
+                        "BREAKEVEN ARMED "
+                        "%s ROI=%.3f",
+                        symbol,
+                        value
+                    )
+
+                if (
+                    state["breakeven_done"]
+                    and value <= BE_STOP
+                ):
+                    close_position(position)
+                    wait_position(symbol)
+                    remove_owned(symbol)
+
+                    log.warning(
+                        "BREAKEVEN STOP EXECUTED "
+                        "%s ROI=%.3f",
+                        symbol,
+                        value
+                    )
+                    continue
+
+                # VWAP take profits are TradingView-controlled.
+                # Railway TP rules apply only to DH positions.
+
+                if strategy == "VWAP":
+                    continue
+
+                if (
+                    FINAL_TP > 0
+                    and value >= FINAL_TP
+                ):
+                    close_position(position)
+                    wait_position(symbol)
+                    remove_owned(symbol)
+                    continue
+
+                if (
+                    PARTIAL_TP > 0
+                    and PARTIAL_CLOSE > 0
+                    and value >= PARTIAL_TP
+                    and not state["partial_done"]
+                ):
+                    result = close_position(
+                        position,
+                        PARTIAL_CLOSE / 100
+                    )
+
+                    if result:
                         mark_state(
                             symbol,
-                            "breakeven_done"
+                            "partial_done"
                         )
+
+                        if BREAKEVEN > 0:
+                            mark_state(
+                                symbol,
+                                "breakeven_done"
+                            )
+
+            except Exception:
+                log.exception(
+                    "RISK ERROR symbol=%s; "
+                    "manual review required",
+                    symbol
+                )
 
 
 def risk_worker():
@@ -945,7 +1154,7 @@ def risk_worker():
 def health():
     return jsonify(
         status="ok",
-        bot="MAQ DH V8",
+        bot="MAQ DH V8 + VWAP V1",
         live=LIVE,
         testnet=TESTNET
     )
@@ -961,9 +1170,14 @@ def status():
         """).fetchall()
 
     return jsonify(
-        bot="MAQ DH V8",
+        bot="MAQ DH V8 + VWAP V1",
         live=LIVE,
         testnet=TESTNET,
+        vwap_enabled=VWAP_ENABLED,
+        initial_stop_loss_roi_pct=INITIAL_SL,
+        breakeven_trigger_roi_pct=BREAKEVEN,
+        breakeven_stop_roi_pct=BE_STOP,
+        stop_type="software_polling_only_not_exchange_side",
         queue={
             row["status"]: row["count"]
             for row in rows
