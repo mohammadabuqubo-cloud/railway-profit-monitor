@@ -12,38 +12,17 @@ import threading
 from decimal import Decimal, ROUND_DOWN
 from flask import Flask, request, jsonify
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
 
 # ============================================================
-# MAQ BINANCE FUTURES BOT
+# MAQ FUTURES BOT
+# TradingView: BUY / SELL / PARTIAL / CLOSE
+# Railway: Stop Loss / Breakeven
 #
-# TradingView:
-# BUY|BTCUSDT
-# SELL|BTCUSDT
-# PARTIAL|BTCUSDT|20
-# CLOSE|BTCUSDT
-#
-# Also supports:
-# VWAP|BUY|BTCUSDT
-# VWAP|SELL|BTCUSDT
-# VWAP|TP1|BTCUSDT
-# VWAP|TP2|BTCUSDT
-# VWAP|TP3|BTCUSDT
-# VWAP|TP4|BTCUSDT
-# VWAP|TP5|BTCUSDT
-# VWAP|CLOSE|BTCUSDT
-#
-# Railway:
-# Initial SL and Breakeven based on Binance entry price.
-#
-# IMPORTANT:
-# - One-way Futures Mode only
-# - Software stops, not exchange-native stop orders
-# - Single Railway replica / single Gunicorn worker
-# - Use a persistent Railway volume for SQLite
-# - Live execution disabled by default
+# Binance USD-M Futures, One-Way Mode
+# Single Gunicorn worker and Railway replica required
 # ============================================================
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +30,6 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("MAQ")
-
 app = Flask(__name__)
 
 
@@ -64,123 +42,107 @@ def env(name, default=""):
     return str(default if value is None else value).strip()
 
 
-def boolean(name, default=False):
+def env_bool(name, default=False):
     return env(
         name,
         "true" if default else "false"
     ).lower() in ("true", "1", "yes", "on")
 
 
-def number(name, default):
-    value = env(name)
-    return float(value) if value else float(default)
+def env_float(name, default):
+    return float(env(name, default))
 
 
 API_KEY = env("BINANCE_API_KEY")
 API_SECRET = env("BINANCE_API_SECRET")
 
-ENABLE_LIVE_ORDERS = boolean(
-    "ENABLE_LIVE_ORDERS", False
-)
-
-BINANCE_TESTNET = boolean(
-    "BINANCE_TESTNET", False
-)
+LIVE = env_bool("ENABLE_LIVE_ORDERS", False)
+TESTNET = env_bool("BINANCE_TESTNET", False)
 
 WEBHOOK_SECRET = env("WEBHOOK_SECRET")
 
-ORDER_MARGIN_USDT = number(
+ORDER_MARGIN = env_float(
     "ORDER_MARGIN_USDT", 50
 )
 
-ENTRY_LEVERAGE = int(
-    number("ENTRY_LEVERAGE", 16)
+LEVERAGE = int(
+    env_float("ENTRY_LEVERAGE", 16)
 )
 
-INITIAL_STOP_LOSS_ROI_PCT = number(
+INITIAL_SL = env_float(
     "INITIAL_STOP_LOSS_ROI_PCT", 20
 )
 
-BREAKEVEN_TRIGGER_ROI_PCT = number(
+BE_TRIGGER = env_float(
     "BREAKEVEN_TRIGGER_ROI_PCT", 10
 )
 
-BREAKEVEN_STOP_ROI_PCT = number(
+BE_STOP = env_float(
     "BREAKEVEN_STOP_ROI_PCT", 0
 )
 
-POLL_INTERVAL_SECONDS = max(
-    5,
-    int(number("POLL_INTERVAL_SECONDS", 5))
+POLL_SECONDS = max(
+    15,
+    int(env_float("POLL_INTERVAL_SECONDS", 15))
 )
 
 PARTIAL_DEDUP_SECONDS = max(
     1,
-    int(number("PARTIAL_DEDUP_SECONDS", 15))
+    int(env_float("PARTIAL_DEDUP_SECONDS", 15))
 )
 
-MAX_ALERT_AGE_SECONDS = max(
+MAX_ALERT_AGE = max(
     30,
-    int(number("MAX_ALERT_AGE_SECONDS", 180))
+    int(env_float("MAX_ALERT_AGE_SECONDS", 180))
 )
 
-BOT_DB_PATH = env(
+DB_PATH = env(
     "BOT_DB_PATH",
     "/data/maq_bot.sqlite3"
 )
 
-# When True, mismatched entry prices are logged.
-# Binance actual entry price is used for risk calculation.
-LOG_ENTRY_MISMATCH = boolean(
-    "LOG_ENTRY_MISMATCH", True
+# Prevent new entries while unresolved old
+# positions exist.
+BLOCK_NEW_ON_MISMATCH = env_bool(
+    "BLOCK_NEW_ENTRIES_ON_MISMATCH",
+    True
 )
 
-# Optional: refuse new positions when unresolved
-# existing bot positions are detected.
-BLOCK_NEW_ENTRIES_ON_MISMATCH = boolean(
-    "BLOCK_NEW_ENTRIES_ON_MISMATCH", True
-)
+if LIVE and (not API_KEY or not API_SECRET):
+    raise RuntimeError(
+        "Missing Binance API credentials"
+    )
 
+if ORDER_MARGIN <= 0 or LEVERAGE <= 0:
+    raise RuntimeError(
+        "Invalid margin or leverage"
+    )
 
-if ENABLE_LIVE_ORDERS:
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError(
-            "Binance API credentials are missing"
-        )
-
-if ORDER_MARGIN_USDT <= 0:
-    raise RuntimeError("Invalid margin")
-
-if ENTRY_LEVERAGE < 1:
-    raise RuntimeError("Invalid leverage")
-
-if INITIAL_STOP_LOSS_ROI_PCT <= 0:
-    raise RuntimeError("Invalid initial SL")
+if INITIAL_SL <= 0:
+    raise RuntimeError(
+        "Initial stop loss must be positive"
+    )
 
 
 # ============================================================
-# LOCKS AND CLIENT
+# SHARED LOCKS
 # ============================================================
 
 DB_LOCK = threading.RLock()
 TRADE_LOCK = threading.RLock()
-CLIENT_LOCK = threading.Lock()
+API_LOCK = threading.RLock()
 
 _client = None
 
+# Binance request-weight cooldown.
+API_PAUSE_UNTIL = 0.0
 
-def client():
-    global _client
+# Cache exchange information for six hours.
+EXCHANGE_CACHE = None
+EXCHANGE_CACHE_TIME = 0.0
 
-    with CLIENT_LOCK:
-        if _client is None:
-            _client = Client(
-                API_KEY,
-                API_SECRET,
-                testnet=BINANCE_TESTNET
-            )
-
-        return _client
+# Avoid repeated mismatch warnings every cycle.
+MISMATCH_LOG_TIME = {}
 
 
 # ============================================================
@@ -188,26 +150,28 @@ def client():
 # ============================================================
 
 os.makedirs(
-    os.path.dirname(BOT_DB_PATH) or ".",
+    os.path.dirname(DB_PATH) or ".",
     exist_ok=True
 )
 
 
-def database():
-    conn = sqlite3.connect(
-        BOT_DB_PATH,
-        timeout=20
+def db():
+    connection = sqlite3.connect(
+        DB_PATH,
+        timeout=30
     )
-
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=20000")
-    conn.execute("PRAGMA journal_mode=WAL")
-
-    return conn
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "PRAGMA busy_timeout=30000"
+    )
+    connection.execute(
+        "PRAGMA journal_mode=WAL"
+    )
+    return connection
 
 
 def init_db():
-    with DB_LOCK, database() as conn:
+    with DB_LOCK, db() as conn:
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
@@ -243,7 +207,7 @@ def init_db():
             )
         """)
 
-        migrations = (
+        for table, column, definition in (
             (
                 "bot_positions",
                 "strategy",
@@ -253,39 +217,26 @@ def init_db():
                 "position_state",
                 "tp_count",
                 "INTEGER DEFAULT 0"
-            ),
-            (
-                "position_state",
-                "breakeven_done",
-                "INTEGER DEFAULT 0"
-            ),
-            (
-                "position_state",
-                "partial_done",
-                "INTEGER DEFAULT 0"
             )
-        )
-
-        for table, column, definition in migrations:
-            existing = {
+        ):
+            columns = {
                 row[1]
                 for row in conn.execute(
                     f"PRAGMA table_info({table})"
                 )
             }
 
-            if column not in existing:
+            if column not in columns:
                 conn.execute(
                     f"ALTER TABLE {table} "
                     f"ADD COLUMN {column} {definition}"
                 )
 
-        # Do not automatically replay orders that were
-        # interrupted by a deployment or process restart.
+        # Interrupted executions are NOT replayed.
         conn.execute("""
             UPDATE alerts
             SET status='needs_review',
-                error='Interrupted order; verify Binance',
+                error='Execution interrupted; check Binance',
                 updated_at=?
             WHERE status='processing'
         """, (time.time(),))
@@ -295,46 +246,477 @@ init_db()
 
 
 # ============================================================
-# SYMBOLS AND ALERTS
+# BINANCE API + RATE LIMIT HANDLING
 # ============================================================
 
-def normalize_symbol(raw):
-    symbol = str(raw).upper().strip()
+def client():
+    global _client
 
-    if ":" in symbol:
-        symbol = symbol.split(":")[-1]
+    with API_LOCK:
+        if _client is None:
+            _client = Client(
+                API_KEY,
+                API_SECRET,
+                testnet=TESTNET
+            )
+        return _client
 
-    if symbol.endswith(".P"):
-        symbol = symbol[:-2]
 
-    symbol = (
-        symbol.replace("/", "")
+def api_call(method, *args, **kwargs):
+    """
+    Central Binance API wrapper.
+
+    On Binance rate-limit errors:
+    - Enter cooldown.
+    - Do not automatically retry orders.
+    - Raise an exception for manual review.
+    """
+
+    global API_PAUSE_UNTIL
+
+    with API_LOCK:
+
+        remaining = API_PAUSE_UNTIL - time.time()
+
+        if remaining > 0:
+            raise RuntimeError(
+                f"Binance API cooldown active: "
+                f"{remaining:.0f}s remaining"
+            )
+
+        try:
+            function = getattr(client(), method)
+            return function(*args, **kwargs)
+
+        except BinanceAPIException as exc:
+
+            if exc.code == -1003:
+                API_PAUSE_UNTIL = max(
+                    API_PAUSE_UNTIL,
+                    time.time() + 120
+                )
+
+                log.error(
+                    "BINANCE RATE LIMIT. "
+                    "Pausing API requests for 120s."
+                )
+
+            elif exc.code == -1015:
+                API_PAUSE_UNTIL = max(
+                    API_PAUSE_UNTIL,
+                    time.time() + 60
+                )
+
+                log.error(
+                    "BINANCE ORDER RATE LIMIT. "
+                    "Pausing API requests for 60s."
+                )
+
+            raise
+
+
+# ============================================================
+# EXCHANGE INFORMATION CACHE
+# ============================================================
+
+def exchange_info():
+    global EXCHANGE_CACHE
+    global EXCHANGE_CACHE_TIME
+
+    with API_LOCK:
+
+        if (
+            EXCHANGE_CACHE is not None
+            and time.time() - EXCHANGE_CACHE_TIME
+            < 21600
+        ):
+            return EXCHANGE_CACHE
+
+        info = api_call(
+            "futures_exchange_info"
+        )
+
+        EXCHANGE_CACHE = {
+            item["symbol"]: item
+            for item in info["symbols"]
+        }
+
+        EXCHANGE_CACHE_TIME = time.time()
+
+        log.info(
+            "Exchange symbol rules cached"
+        )
+
+        return EXCHANGE_CACHE
+
+
+def symbol_rules(symbol):
+    info = exchange_info().get(symbol)
+
+    if not info:
+        raise RuntimeError(
+            f"Unknown Binance symbol: {symbol}"
+        )
+
+    if info["status"] != "TRADING":
+        raise RuntimeError(
+            f"Symbol not trading: {symbol}"
+        )
+
+    filters = {
+        item["filterType"]: item
+        for item in info["filters"]
+    }
+
+    market = filters.get(
+        "MARKET_LOT_SIZE", {}
+    )
+
+    lot = filters.get(
+        "LOT_SIZE", {}
+    )
+
+    step = Decimal(
+        market.get("stepSize", "0")
+    )
+
+    if step <= 0:
+        step = Decimal(
+            lot.get("stepSize", "0")
+        )
+
+    if step <= 0:
+        raise RuntimeError(
+            f"Invalid quantity step: {symbol}"
+        )
+
+    min_qty = Decimal(
+        market.get("minQty", "0")
+    )
+
+    if min_qty <= 0:
+        min_qty = Decimal(
+            lot.get("minQty", "0")
+        )
+
+    return step, min_qty
+
+
+def round_qty(symbol, quantity):
+    step, minimum = symbol_rules(symbol)
+
+    quantity = Decimal(
+        str(quantity)
+    )
+
+    rounded = (
+        quantity / step
+    ).to_integral_value(
+        rounding=ROUND_DOWN
+    ) * step
+
+    if rounded < minimum:
+        raise RuntimeError(
+            f"{symbol}: quantity below minimum"
+        )
+
+    return str(rounded)
+
+
+# ============================================================
+# POSITION DATA
+# ============================================================
+
+def all_positions():
+    data = api_call(
+        "futures_position_information"
+    )
+
+    return {
+        p["symbol"]: p
+        for p in data
+        if abs(float(p["positionAmt"])) > 0
+    }
+
+
+def get_position(symbol):
+    data = api_call(
+        "futures_position_information",
+        symbol=symbol
+    )
+
+    active = [
+        p for p in data
+        if abs(float(p["positionAmt"])) > 0
+    ]
+
+    if len(active) > 1:
+        raise RuntimeError(
+            "Hedge Mode not supported"
+        )
+
+    if active:
+        if active[0].get(
+            "positionSide", "BOTH"
+        ) != "BOTH":
+            raise RuntimeError(
+                "One-way Mode required"
+            )
+
+        return active[0]
+
+    return None
+
+
+def order_market(
+    symbol,
+    side,
+    quantity,
+    reduce_only=False
+):
+    qty = round_qty(
+        symbol,
+        quantity
+    )
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty
+    }
+
+    if reduce_only:
+        params["reduceOnly"] = True
+
+    # Never automatically retry this call.
+    # A network failure can leave an order's
+    # actual execution status uncertain.
+    result = api_call(
+        "futures_create_order",
+        **params
+    )
+
+    log.warning(
+        "ORDER SUBMITTED %s %s qty=%s "
+        "reduceOnly=%s orderId=%s",
+        symbol,
+        side,
+        qty,
+        reduce_only,
+        result.get("orderId")
+    )
+
+    return result
+
+
+def close_position(position):
+    amount = float(
+        position["positionAmt"]
+    )
+
+    if amount == 0:
+        return None
+
+    side = (
+        "SELL" if amount > 0 else "BUY"
+    )
+
+    return order_market(
+        position["symbol"],
+        side,
+        abs(amount),
+        reduce_only=True
+    )
+
+
+def wait_for_position(
+    symbol,
+    direction=None
+):
+    for _ in range(6):
+
+        time.sleep(1)
+
+        position = get_position(symbol)
+
+        if direction is None:
+            if not position:
+                return None
+
+        elif position:
+            amount = float(
+                position["positionAmt"]
+            )
+
+            if direction == "BUY" and amount > 0:
+                return position
+
+            if direction == "SELL" and amount < 0:
+                return position
+
+    raise RuntimeError(
+        "Binance position confirmation failed. "
+        "Manual review required."
+    )
+
+
+# ============================================================
+# POSITION STATE
+# ============================================================
+
+def owned(symbol):
+    with DB_LOCK, db() as conn:
+        row = conn.execute("""
+            SELECT 1
+            FROM bot_positions
+            WHERE symbol=?
+        """, (symbol,)).fetchone()
+
+        return row is not None
+
+
+def get_state(symbol):
+    with DB_LOCK, db() as conn:
+        row = conn.execute("""
+            SELECT *
+            FROM position_state
+            WHERE symbol=?
+        """, (symbol,)).fetchone()
+
+        return dict(row) if row else None
+
+
+def save_position(symbol, direction, position):
+    entry = float(
+        position["entryPrice"]
+    )
+
+    qty = abs(
+        float(position["positionAmt"])
+    )
+
+    with DB_LOCK, db() as conn:
+
+        conn.execute("""
+            INSERT OR REPLACE INTO bot_positions
+            (symbol, direction, created_at, strategy)
+            VALUES (?, ?, ?, 'VWAP')
+        """, (
+            symbol,
+            direction,
+            time.time()
+        ))
+
+        conn.execute("""
+            INSERT OR REPLACE INTO position_state
+            (
+                symbol,
+                entry_price,
+                entry_qty,
+                partial_done,
+                breakeven_done,
+                tp_count
+            )
+            VALUES (?, ?, ?, 0, 0, 0)
+        """, (
+            symbol,
+            entry,
+            qty
+        ))
+
+
+def remove_position(symbol):
+    with DB_LOCK, db() as conn:
+        conn.execute(
+            "DELETE FROM bot_positions "
+            "WHERE symbol=?",
+            (symbol,)
+        )
+
+        conn.execute(
+            "DELETE FROM position_state "
+            "WHERE symbol=?",
+            (symbol,)
+        )
+
+
+def log_entry_mismatch(position, state):
+    symbol = position["symbol"]
+
+    saved = float(
+        state["entry_price"]
+    )
+
+    actual = float(
+        position["entryPrice"]
+    )
+
+    difference = abs(saved - actual)
+
+    if difference <= max(
+        abs(actual) * 0.000001,
+        1e-12
+    ):
+        return False
+
+    now = time.time()
+
+    if (
+        now - MISMATCH_LOG_TIME.get(
+            symbol, 0
+        ) >= 300
+    ):
+        log.warning(
+            "ENTRY MISMATCH %s "
+            "saved=%s Binance=%s",
+            symbol,
+            saved,
+            actual
+        )
+
+        MISMATCH_LOG_TIME[symbol] = now
+
+    return True
+
+
+# ============================================================
+# TRADINGVIEW ALERT PARSER
+# ============================================================
+
+def normalize_symbol(value):
+    value = str(value).strip().upper()
+
+    if ":" in value:
+        value = value.split(":")[-1]
+
+    if value.endswith(".P"):
+        value = value[:-2]
+
+    value = (
+        value.replace("/", "")
         .replace("-", "")
         .replace("_", "")
     )
 
     if not re.fullmatch(
-        r"[A-Z0-9]{5,30}", symbol
+        r"[A-Z0-9]{5,30}",
+        value
     ):
         raise ValueError(
-            f"Invalid symbol: {raw}"
+            "Invalid trading symbol"
         )
 
-    return symbol
+    return value
 
 
 def parse_message(message):
     message = str(message or "").strip()
 
-    # Plain TradingView alerts:
-    # BUY|BTCUSDT
-    # SELL|BTCUSDT
-    # CLOSE|BTCUSDT
-    # PARTIAL|BTCUSDT|20
-
+    # VWAP|TP1|FILUSDT
     match = re.fullmatch(
-        r"(BUY|SELL|CLOSE)\s*\|\s*"
-        r"([A-Za-z0-9:._/\-]+)",
+        r"VWAP\|(BUY|SELL|TP[1-5]|CLOSE)"
+        r"\|([A-Za-z0-9:._/\-]+)",
         message,
         re.IGNORECASE
     )
@@ -345,20 +727,18 @@ def parse_message(message):
             normalize_symbol(match.group(2))
         )
 
+    # PARTIAL|FILUSDT|20
     match = re.fullmatch(
-        r"PARTIAL\s*\|\s*"
-        r"([A-Za-z0-9:._/\-]+)\s*\|\s*"
-        r"([0-9]+(?:\.[0-9]+)?)",
+        r"PARTIAL\|([A-Za-z0-9:._/\-]+)"
+        r"\|([0-9]+(?:\.[0-9]+)?)",
         message,
         re.IGNORECASE
     )
 
     if match:
-        percent = float(match.group(2))
-
-        if percent != 20:
+        if float(match.group(2)) != 20:
             raise ValueError(
-                "This bot supports 20% partial TP only"
+                "Only 20% partial TP supported"
             )
 
         return (
@@ -366,29 +746,11 @@ def parse_message(message):
             normalize_symbol(match.group(1))
         )
 
-    # Unique VWAP messages:
-    # VWAP|TP1|BTCUSDT, etc.
-
+    # BUY|FILUSDT / SELL|FILUSDT
+    # CLOSE|FILUSDT
     match = re.fullmatch(
-        r"VWAP\s*\|\s*"
-        r"(BUY|SELL|TP[1-5]|CLOSE)\s*\|\s*"
-        r"([A-Za-z0-9:._/\-]+)",
-        message,
-        re.IGNORECASE
-    )
-
-    if match:
-        return (
-            match.group(1).upper(),
-            normalize_symbol(match.group(2))
-        )
-
-    # Legacy DH order-fill text
-
-    match = re.search(
-        r"\border\s+(buy|sell)\s+@\s+"
-        r"[^\r\n]*?\bfilled\s+on\s+"
-        r"([A-Za-z0-9:._/\-]+)",
+        r"(BUY|SELL|CLOSE)"
+        r"\|([A-Za-z0-9:._/\-]+)",
         message,
         re.IGNORECASE
     )
@@ -400,7 +762,7 @@ def parse_message(message):
         )
 
     raise ValueError(
-        f"Unsupported alert: {message[:150]}"
+        "Unsupported TradingView message"
     )
 
 
@@ -414,10 +776,13 @@ def extract_alert():
             signal, symbol = parse_message(raw)
             return signal, symbol, raw
 
-        if payload.get("signal") and payload.get("symbol"):
+        if (
+            payload.get("signal")
+            and payload.get("symbol")
+        ):
             signal = str(
                 payload["signal"]
-            ).upper().strip()
+            ).upper()
 
             symbol = normalize_symbol(
                 payload["symbol"]
@@ -428,23 +793,30 @@ def extract_alert():
                 "CLOSE", "TP1", "TP2",
                 "TP3", "TP4", "TP5"
             ):
-                raise ValueError("Invalid signal")
+                raise ValueError(
+                    "Invalid signal"
+                )
 
             if signal == "PARTIAL":
                 if float(
                     payload.get("percentage", 20)
                 ) != 20:
                     raise ValueError(
-                        "Only 20% partial TP supported"
+                        "Only 20% supported"
                     )
 
             return (
                 signal,
                 symbol,
-                json.dumps(payload, sort_keys=True)
+                json.dumps(
+                    payload,
+                    sort_keys=True
+                )
             )
 
-    raw = request.get_data(as_text=True)
+    raw = request.get_data(
+        as_text=True
+    )
 
     signal, symbol = parse_message(raw)
 
@@ -471,47 +843,31 @@ def webhook():
             WEBHOOK_SECRET
         ):
             return jsonify(
-                status="unauthorized"
+                error="Unauthorized"
             ), 403
 
     try:
         signal, symbol, raw = extract_alert()
         now = time.time()
 
-        # For unique TP1-TP5 alerts, prevent repeated
-        # delivery of the same numbered TP.
+        # Identical plain PARTIAL alerts cannot be
+        # reliably distinguished. Suppress alerts
+        # received within the configured window.
         #
-        # For plain PARTIAL alerts, use a short time
-        # window. This cannot distinguish every real
-        # TP from a retry.
+        # Genuine TPs inside that window may be
+        # suppressed. Use unique TP1-TP5 messages
+        # for reliable sequencing.
 
-        unique_tp = bool(
-            re.fullmatch(r"TP[1-5]", signal)
-        )
-
-        if unique_tp:
-            dedup_key = (
-                f"{signal}|{symbol}|{raw}"
-            )
-            fingerprint = hashlib.sha256(
-                dedup_key.encode()
-            ).hexdigest()
-        else:
-            fingerprint = hashlib.sha256(
-                f"{signal}|{symbol}|{raw}|{now}".encode()
-            ).hexdigest()
-
-        with DB_LOCK, database() as conn:
+        with DB_LOCK, db() as conn:
 
             if signal == "PARTIAL":
-                previous = conn.execute("""
+                duplicate = conn.execute("""
                     SELECT id
                     FROM alerts
                     WHERE symbol=?
                       AND signal='PARTIAL'
                       AND raw_message=?
                       AND received_at>=?
-                    ORDER BY id DESC
                     LIMIT 1
                 """, (
                     symbol,
@@ -519,19 +875,19 @@ def webhook():
                     now - PARTIAL_DEDUP_SECONDS
                 )).fetchone()
 
-                if previous:
-                    log.warning(
-                        "Duplicate PARTIAL suppressed %s",
-                        symbol
-                    )
-
+                if duplicate:
                     return jsonify(
                         status="duplicate_suppressed",
                         symbol=symbol
                     )
 
-            cursor = conn.execute("""
-                INSERT OR IGNORE INTO alerts (
+            fingerprint = hashlib.sha256(
+                f"{signal}|{symbol}|{raw}|{now}".encode()
+            ).hexdigest()
+
+            conn.execute("""
+                INSERT INTO alerts
+                (
                     fingerprint,
                     symbol,
                     signal,
@@ -550,540 +906,126 @@ def webhook():
                 now
             ))
 
-            inserted = cursor.rowcount == 1
-
         log.info(
-            "WEBHOOK %s %s status=%s",
+            "WEBHOOK QUEUED %s %s",
             signal,
-            symbol,
-            "queued" if inserted else "duplicate"
+            symbol
         )
 
         return jsonify(
-            status="queued" if inserted else "duplicate",
-            symbol=symbol,
-            signal=signal
+            status="queued",
+            signal=signal,
+            symbol=symbol
         )
 
     except (ValueError, TypeError) as exc:
-        log.warning(
-            "Invalid webhook: %s", exc
-        )
-
         return jsonify(
             error=str(exc)
         ), 400
 
     except Exception:
         log.exception("Webhook error")
-
         return jsonify(
-            error="Webhook processing failed"
+            error="Webhook failure"
         ), 503
 
 
 # ============================================================
-# BINANCE POSITION HELPERS
-# ============================================================
-
-def get_positions(symbol=None):
-    kwargs = (
-        {"symbol": symbol}
-        if symbol else {}
-    )
-
-    result = (
-        client().futures_position_information(
-            **kwargs
-        )
-    )
-
-    return [
-        p for p in result
-        if abs(float(p["positionAmt"])) > 0
-    ]
-
-
-def get_position(symbol):
-    result = get_positions(symbol)
-
-    if len(result) > 1:
-        raise RuntimeError(
-            "Hedge Mode not supported"
-        )
-
-    if result:
-        if result[0].get(
-            "positionSide", "BOTH"
-        ) != "BOTH":
-            raise RuntimeError(
-                "One-way Futures Mode required"
-            )
-
-        return result[0]
-
-    return None
-
-
-def get_step_size(symbol):
-    info = client().futures_exchange_info()
-
-    for item in info["symbols"]:
-        if item["symbol"] != symbol:
-            continue
-
-        if item["status"] != "TRADING":
-            raise RuntimeError(
-                "Symbol not trading"
-            )
-
-        filters = item["filters"]
-
-        for filter_name in (
-            "MARKET_LOT_SIZE",
-            "LOT_SIZE"
-        ):
-            for f in filters:
-                if f["filterType"] == filter_name:
-                    step = Decimal(
-                        f["stepSize"]
-                    )
-
-                    if step > 0:
-                        return step
-
-    raise RuntimeError(
-        f"No quantity step for {symbol}"
-    )
-
-
-def round_quantity(symbol, quantity):
-    step = get_step_size(symbol)
-
-    value = Decimal(str(quantity))
-
-    return float(
-        (value / step).to_integral_value(
-            rounding=ROUND_DOWN
-        ) * step
-    )
-
-
-def place_market_order(
-    symbol,
-    side,
-    quantity,
-    reduce_only=False
-):
-    quantity = round_quantity(
-        symbol,
-        quantity
-    )
-
-    if quantity <= 0:
-        raise RuntimeError(
-            "Quantity below minimum step"
-        )
-
-    kwargs = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "quantity": quantity
-    }
-
-    if reduce_only:
-        kwargs["reduceOnly"] = True
-
-    result = client().futures_create_order(
-        **kwargs
-    )
-
-    log.warning(
-        "BINANCE ORDER SUBMITTED "
-        "symbol=%s side=%s qty=%s "
-        "reduceOnly=%s orderId=%s",
-        symbol,
-        side,
-        quantity,
-        reduce_only,
-        result.get("orderId")
-    )
-
-    return result
-
-
-def close_position(position):
-    amount = float(
-        position["positionAmt"]
-    )
-
-    if amount == 0:
-        return None
-
-    side = (
-        "SELL" if amount > 0 else "BUY"
-    )
-
-    return place_market_order(
-        position["symbol"],
-        side,
-        abs(amount),
-        reduce_only=True
-    )
-
-
-def wait_for_position(
-    symbol,
-    direction=None,
-    attempts=20
-):
-    for _ in range(attempts):
-        position = get_position(symbol)
-
-        if direction is None:
-            if not position:
-                return None
-
-        elif position:
-            amount = float(
-                position["positionAmt"]
-            )
-
-            if direction == "BUY" and amount > 0:
-                return position
-
-            if direction == "SELL" and amount < 0:
-                return position
-
-        time.sleep(0.5)
-
-    raise RuntimeError(
-        "Position confirmation timeout. "
-        "Check Binance manually."
-    )
-
-
-# ============================================================
-# OWNERSHIP AND POSITION STATE
-# ============================================================
-
-def is_owned(symbol):
-    with DB_LOCK, database() as conn:
-        row = conn.execute("""
-            SELECT 1
-            FROM bot_positions
-            WHERE symbol=?
-        """, (symbol,)).fetchone()
-
-        return row is not None
-
-
-def get_saved_state(symbol):
-    with DB_LOCK, database() as conn:
-        row = conn.execute("""
-            SELECT *
-            FROM position_state
-            WHERE symbol=?
-        """, (symbol,)).fetchone()
-
-        return dict(row) if row else None
-
-
-def save_position(symbol, direction, position):
-    entry = float(
-        position["entryPrice"]
-    )
-
-    quantity = abs(
-        float(position["positionAmt"])
-    )
-
-    with DB_LOCK, database() as conn:
-
-        conn.execute("""
-            INSERT OR REPLACE INTO bot_positions (
-                symbol, direction, created_at, strategy
-            )
-            VALUES (?, ?, ?, 'VWAP')
-        """, (
-            symbol,
-            direction,
-            time.time()
-        ))
-
-        conn.execute("""
-            INSERT OR REPLACE INTO position_state (
-                symbol,
-                entry_price,
-                entry_qty,
-                partial_done,
-                breakeven_done,
-                tp_count
-            )
-            VALUES (?, ?, ?, 0, 0, 0)
-        """, (
-            symbol,
-            entry,
-            quantity
-        ))
-
-
-def remove_position(symbol):
-    with DB_LOCK, database() as conn:
-
-        conn.execute(
-            "DELETE FROM bot_positions WHERE symbol=?",
-            (symbol,)
-        )
-
-        conn.execute(
-            "DELETE FROM position_state WHERE symbol=?",
-            (symbol,)
-        )
-
-
-def reconcile_flat_positions():
-    """
-    Remove old bot state only when Binance confirms
-    that the position is completely flat.
-
-    Does not change or overwrite the entry price
-    of any open position.
-    """
-
-    with TRADE_LOCK:
-
-        with DB_LOCK, database() as conn:
-            rows = conn.execute("""
-                SELECT symbol
-                FROM bot_positions
-            """).fetchall()
-
-        for row in rows:
-            symbol = row["symbol"]
-
-            try:
-                position = get_position(symbol)
-
-                if position is None:
-                    log.info(
-                        "FLAT POSITION CLEANUP %s",
-                        symbol
-                    )
-                    remove_position(symbol)
-
-            except Exception:
-                log.exception(
-                    "Flat cleanup failed %s",
-                    symbol
-                )
-
-
-def entry_mismatch(position, state):
-    if not state:
-        return False
-
-    saved = float(
-        state["entry_price"]
-    )
-
-    actual = float(
-        position["entryPrice"]
-    )
-
-    return abs(saved - actual) > max(
-        abs(actual) * 0.000001,
-        1e-12
-    )
-
-
-def log_mismatch(position, state):
-    if (
-        state
-        and LOG_ENTRY_MISMATCH
-        and entry_mismatch(position, state)
-    ):
-        log.warning(
-            "ENTRY PRICE MISMATCH %s "
-            "saved=%s Binance=%s; "
-            "using Binance entry for risk, "
-            "preserving original TP state",
-            position["symbol"],
-            state["entry_price"],
-            position["entryPrice"]
-        )
-
-
-def update_breakeven(symbol):
-    with DB_LOCK, database() as conn:
-        conn.execute("""
-            UPDATE position_state
-            SET breakeven_done=1
-            WHERE symbol=?
-        """, (symbol,))
-
-
-def update_tp_count(symbol, count):
-    with DB_LOCK, database() as conn:
-        conn.execute("""
-            UPDATE position_state
-            SET tp_count=?,
-                partial_done=?
-            WHERE symbol=?
-        """, (
-            count,
-            1 if count > 0 else 0,
-            symbol
-        ))
-
-
-# ============================================================
-# RISK CALCULATION
-# ============================================================
-
-def calculate_roi(position):
-    entry = float(
-        position["entryPrice"]
-    )
-
-    mark = float(
-        position["markPrice"]
-    )
-
-    leverage = float(
-        position.get("leverage") or 1
-    )
-
-    amount = float(
-        position["positionAmt"]
-    )
-
-    if entry <= 0 or mark <= 0:
-        raise RuntimeError(
-            "Invalid Binance price"
-        )
-
-    direction = (
-        1 if amount > 0 else -1
-    )
-
-    return (
-        ((mark - entry) / entry)
-        * direction
-        * leverage
-        * 100
-    )
-
-
-# ============================================================
-# BLOCK UNRESOLVED ENTRIES
-# ============================================================
-
-def has_unresolved_mismatches():
-    if not BLOCK_NEW_ENTRIES_ON_MISMATCH:
-        return False
-
-    with DB_LOCK, database() as conn:
-        rows = conn.execute("""
-            SELECT symbol
-            FROM bot_positions
-        """).fetchall()
-
-    for row in rows:
-        symbol = row["symbol"]
-        position = get_position(symbol)
-
-        if not position:
-            continue
-
-        state = get_saved_state(symbol)
-
-        if state and entry_mismatch(position, state):
-            return True
-
-    return False
-
-
-# ============================================================
-# ENTRY EXECUTION
+# ENTRY ENGINE
 # ============================================================
 
 def execute_entry(signal, symbol):
     with TRADE_LOCK:
 
-        position_mode = (
-            client().futures_get_position_mode()
+        mode = api_call(
+            "futures_get_position_mode"
         )
 
-        if position_mode.get("dualSidePosition"):
+        if mode.get("dualSidePosition"):
             raise RuntimeError(
-                "Switch Binance to One-way Mode"
+                "One-way Position Mode required"
             )
 
-        existing = get_position(symbol)
+        current = get_position(symbol)
 
-        if existing:
-
-            if not is_owned(symbol):
+        if current:
+            if not owned(symbol):
                 raise RuntimeError(
-                    "Existing position not owned "
-                    "by Railway"
+                    "Existing position not bot-owned"
                 )
 
-            current_direction = (
+            direction = (
                 "BUY"
                 if float(
-                    existing["positionAmt"]
+                    current["positionAmt"]
                 ) > 0
                 else "SELL"
             )
 
-            if current_direction == signal:
-                log.info(
-                    "Already in %s %s",
-                    signal,
-                    symbol
-                )
+            if direction == signal:
                 return "already_in_position"
 
-        if has_unresolved_mismatches():
-            raise RuntimeError(
-                "Unresolved entry-price mismatch "
-                "exists. New entries blocked."
-            )
+        if BLOCK_NEW_ON_MISMATCH:
+            with DB_LOCK, db() as conn:
+                rows = conn.execute("""
+                    SELECT symbol
+                    FROM bot_positions
+                """).fetchall()
 
-        # Reverse existing position if required.
-        if existing:
-            close_position(existing)
+            # One Binance snapshot, not a request
+            # for each symbol.
+            snapshot = all_positions()
+
+            for row in rows:
+                sym = row["symbol"]
+                pos = snapshot.get(sym)
+
+                if not pos:
+                    continue
+
+                state = get_state(sym)
+
+                if (
+                    state
+                    and log_entry_mismatch(
+                        pos, state
+                    )
+                ):
+                    raise RuntimeError(
+                        "Unreconciled existing position. "
+                        "New entry blocked."
+                    )
+
+        if current:
+            close_position(current)
             wait_for_position(symbol)
             remove_position(symbol)
 
-        client().futures_change_leverage(
+        api_call(
+            "futures_change_leverage",
             symbol=symbol,
-            leverage=ENTRY_LEVERAGE
+            leverage=LEVERAGE
         )
 
-        ticker = (
-            client().futures_symbol_ticker(
-                symbol=symbol
-            )
+        ticker = api_call(
+            "futures_symbol_ticker",
+            symbol=symbol
         )
 
         price = float(
             ticker["price"]
         )
 
-        quantity = (
-            ORDER_MARGIN_USDT
-            * ENTRY_LEVERAGE
+        qty = (
+            ORDER_MARGIN
+            * LEVERAGE
             / price
         )
 
-        place_market_order(
+        order_market(
             symbol,
             signal,
-            quantity
+            qty
         )
 
         position = wait_for_position(
@@ -1097,15 +1039,6 @@ def execute_entry(signal, symbol):
             position
         )
 
-        log.info(
-            "ENTRY CONFIRMED %s %s "
-            "entry=%s qty=%s",
-            signal,
-            symbol,
-            position["entryPrice"],
-            position["positionAmt"]
-        )
-
         return "entry_executed"
 
 
@@ -1116,9 +1049,9 @@ def execute_entry(signal, symbol):
 def execute_partial(symbol, requested_tp=None):
     with TRADE_LOCK:
 
-        if not is_owned(symbol):
+        if not owned(symbol):
             raise RuntimeError(
-                "Position is not owned by Railway"
+                "Position not owned by Railway"
             )
 
         position = get_position(symbol)
@@ -1127,21 +1060,19 @@ def execute_partial(symbol, requested_tp=None):
             remove_position(symbol)
             return "already_flat"
 
-        state = get_saved_state(symbol)
+        state = get_state(symbol)
 
         if not state:
             raise RuntimeError(
-                "Missing original position state. "
-                "Manual reconciliation required."
+                "Missing original position state"
             )
 
-        # IMPORTANT:
-        # Entry-price mismatch does NOT automatically
-        # prevent partial TP execution.
-        #
-        # We verify ownership, quantity, direction,
-        # and TP progress instead.
-        log_mismatch(position, state)
+        # Log entry-price mismatch but do not
+        # automatically overwrite saved values.
+        log_entry_mismatch(
+            position,
+            state
+        )
 
         count = int(
             state["tp_count"] or 0
@@ -1157,13 +1088,12 @@ def execute_partial(symbol, requested_tp=None):
 
         if original_qty <= 0:
             raise RuntimeError(
-                "Invalid original position quantity"
+                "Invalid original quantity"
             )
 
         if current_qty > original_qty * 1.000001:
             raise RuntimeError(
-                "Binance position larger than "
-                "original saved position. "
+                "Position quantity increased. "
                 "Manual reconciliation required."
             )
 
@@ -1171,14 +1101,12 @@ def execute_partial(symbol, requested_tp=None):
             return "all_tps_completed"
 
         if requested_tp is not None:
-
-            # Reject old and out-of-sequence TP alerts.
             if requested_tp <= count:
-                return "tp_already_processed"
+                return "tp_already_completed"
 
             if requested_tp != count + 1:
                 raise RuntimeError(
-                    "TP received out of sequence"
+                    "TP out of sequence"
                 )
 
         next_tp = count + 1
@@ -1192,84 +1120,86 @@ def execute_partial(symbol, requested_tp=None):
         )
 
         if next_tp == 5:
-            quantity = current_qty
+            qty = current_qty
         else:
-            quantity = round_quantity(
-                symbol,
-                original_qty * 0.20
+            qty = float(
+                round_qty(
+                    symbol,
+                    original_qty * 0.20
+                )
             )
 
-            if quantity <= 0:
-                raise RuntimeError(
-                    "20% TP below minimum quantity"
-                )
-
-            if quantity >= current_qty:
-                # Closing all remaining quantity at
-                # an early TP would be unexpected.
+            if qty >= current_qty:
                 raise RuntimeError(
                     "Partial TP exceeds remaining "
-                    "position. Manual review required."
+                    "position quantity"
                 )
 
-        log.info(
-            "TP REQUEST %s TP%s "
-            "original=%s remaining=%s "
-            "close_qty=%s",
+        log.warning(
+            "TP EXECUTION %s TP%s "
+            "qty=%s remaining_before=%s",
             symbol,
             next_tp,
-            original_qty,
-            current_qty,
-            quantity
+            qty,
+            current_qty
         )
 
-        place_market_order(
+        order_market(
             symbol,
             side,
-            quantity,
+            qty,
             reduce_only=True
         )
 
-        # Confirm quantity reduction.
-        confirmed = False
-        updated = None
+        # Confirm the Binance position shrank.
+        confirmed = None
 
-        for _ in range(20):
+        for _ in range(5):
+            time.sleep(1)
+
             updated = get_position(symbol)
 
-            new_qty = (
-                abs(float(updated["positionAmt"]))
+            remaining = (
+                abs(float(
+                    updated["positionAmt"]
+                ))
                 if updated else 0
             )
 
-            if new_qty < current_qty:
-                confirmed = True
+            if remaining < current_qty:
+                confirmed = updated
                 break
 
-            time.sleep(0.5)
+        if confirmed is None:
+            # Could be flat, so check once.
+            updated = get_position(symbol)
 
-        if not confirmed:
-            raise RuntimeError(
-                "Partial TP order submitted but "
-                "quantity reduction not confirmed. "
-                "Check Binance before retrying."
-            )
+            if updated is not None:
+                raise RuntimeError(
+                    "TP order status uncertain. "
+                    "Check Binance before retrying."
+                )
 
-        if updated is None:
             remove_position(symbol)
             return "position_fully_closed"
 
-        update_tp_count(
-            symbol,
-            next_tp
-        )
+        with DB_LOCK, db() as conn:
+            conn.execute("""
+                UPDATE position_state
+                SET tp_count=?,
+                    partial_done=1
+                WHERE symbol=?
+            """, (
+                next_tp,
+                symbol
+            ))
 
-        log.info(
+        log.warning(
             "TP CONFIRMED %s TP%s "
             "remaining=%s",
             symbol,
             next_tp,
-            updated["positionAmt"]
+            confirmed["positionAmt"]
         )
 
         return f"tp_{next_tp}_executed"
@@ -1282,7 +1212,7 @@ def execute_partial(symbol, requested_tp=None):
 def execute_close(symbol):
     with TRADE_LOCK:
 
-        if not is_owned(symbol):
+        if not owned(symbol):
             raise RuntimeError(
                 "Position not owned by Railway"
             )
@@ -1295,14 +1225,13 @@ def execute_close(symbol):
 
         close_position(position)
         wait_for_position(symbol)
-
         remove_position(symbol)
 
         return "position_closed"
 
 
 # ============================================================
-# SIGNAL EXECUTION
+# SIGNAL ROUTING
 # ============================================================
 
 def execute_signal(signal, symbol):
@@ -1317,11 +1246,9 @@ def execute_signal(signal, symbol):
         return execute_partial(symbol)
 
     if re.fullmatch(r"TP[1-5]", signal):
-        tp_number = int(signal[2:])
-
         return execute_partial(
             symbol,
-            requested_tp=tp_number
+            requested_tp=int(signal[2:])
         )
 
     if signal == "CLOSE":
@@ -1333,11 +1260,11 @@ def execute_signal(signal, symbol):
 
 
 # ============================================================
-# QUEUE WORKER
+# ALERT QUEUE
 # ============================================================
 
 def claim_alert():
-    with DB_LOCK, database() as conn:
+    with DB_LOCK, db() as conn:
 
         conn.execute("BEGIN IMMEDIATE")
 
@@ -1370,7 +1297,7 @@ def finish_alert(
     status,
     error=None
 ):
-    with DB_LOCK, database() as conn:
+    with DB_LOCK, db() as conn:
         conn.execute("""
             UPDATE alerts
             SET status=?,
@@ -1386,15 +1313,13 @@ def finish_alert(
 
 
 def queue_worker():
-
     log.info(
         "QUEUE STARTED live=%s testnet=%s",
-        ENABLE_LIVE_ORDERS,
-        BINANCE_TESTNET
+        LIVE,
+        TESTNET
     )
 
     while True:
-
         try:
             alert = claim_alert()
 
@@ -1402,26 +1327,22 @@ def queue_worker():
                 time.sleep(0.5)
                 continue
 
-            signal = alert["signal"]
-            symbol = alert["symbol"]
-
-            age = (
+            if (
                 time.time()
                 - alert["received_at"]
-            )
-
-            if age > MAX_ALERT_AGE_SECONDS:
+                > MAX_ALERT_AGE
+            ):
                 finish_alert(
                     alert["id"],
                     "expired"
                 )
                 continue
 
-            if not ENABLE_LIVE_ORDERS:
+            if not LIVE:
                 log.info(
                     "DRY RUN %s %s",
-                    signal,
-                    symbol
+                    alert["signal"],
+                    alert["symbol"]
                 )
 
                 finish_alert(
@@ -1432,8 +1353,8 @@ def queue_worker():
 
             try:
                 result = execute_signal(
-                    signal,
-                    symbol
+                    alert["signal"],
+                    alert["symbol"]
                 )
 
                 finish_alert(
@@ -1443,16 +1364,16 @@ def queue_worker():
 
                 log.info(
                     "ALERT COMPLETED %s %s %s",
-                    signal,
-                    symbol,
+                    alert["signal"],
+                    alert["symbol"],
                     result
                 )
 
             except Exception as exc:
                 log.exception(
                     "ALERT FAILED %s %s",
-                    signal,
-                    symbol
+                    alert["signal"],
+                    alert["symbol"]
                 )
 
                 finish_alert(
@@ -1463,54 +1384,98 @@ def queue_worker():
 
         except Exception:
             log.exception(
-                "Queue worker error"
+                "Queue worker failure"
             )
             time.sleep(2)
 
 
 # ============================================================
-# RAILWAY STOP LOSS + BREAKEVEN
+# RISK MONITOR
 # ============================================================
+
+def calculate_roi(position):
+    entry = float(
+        position["entryPrice"]
+    )
+
+    mark = float(
+        position["markPrice"]
+    )
+
+    amount = float(
+        position["positionAmt"]
+    )
+
+    leverage = float(
+        position.get("leverage") or 1
+    )
+
+    if entry <= 0 or mark <= 0:
+        raise RuntimeError(
+            "Invalid Binance price"
+        )
+
+    direction = (
+        1 if amount > 0 else -1
+    )
+
+    return (
+        (mark - entry)
+        / entry
+        * direction
+        * leverage
+        * 100
+    )
+
 
 def monitor_risk():
 
-    if not ENABLE_LIVE_ORDERS:
+    if not LIVE:
         return
 
     with TRADE_LOCK:
 
-        active_positions = get_positions()
+        # ONE position snapshot per risk cycle.
+        snapshot = all_positions()
 
-        for position in active_positions:
+        with DB_LOCK, db() as conn:
+            rows = conn.execute("""
+                SELECT symbol
+                FROM bot_positions
+            """).fetchall()
 
-            symbol = position["symbol"]
-
-            if not is_owned(symbol):
-                continue
+        for row in rows:
+            symbol = row["symbol"]
 
             try:
-                state = get_saved_state(symbol)
+                position = snapshot.get(symbol)
+
+                if not position:
+                    # Only remove old records after
+                    # Binance confirms position is flat.
+                    remove_position(symbol)
+                    continue
+
+                state = get_state(symbol)
 
                 if not state:
                     log.error(
-                        "RISK NOT MANAGED %s: "
-                        "missing position state",
+                        "UNMANAGED POSITION %s: "
+                        "missing state",
                         symbol
                     )
                     continue
 
-                # Binance actual entry price is used.
-                # Saved price is not overwritten.
-                log_mismatch(position, state)
+                log_entry_mismatch(
+                    position,
+                    state
+                )
 
                 roi = calculate_roi(position)
 
-                # Initial SL
-                if roi <= -INITIAL_STOP_LOSS_ROI_PCT:
-
+                if roi <= -INITIAL_SL:
                     log.warning(
-                        "STOP LOSS TRIGGERED "
-                        "%s ROI=%.2f",
+                        "STOP LOSS %s ROI=%.2f",
                         symbol,
                         roi
                     )
@@ -1518,39 +1483,34 @@ def monitor_risk():
                     close_position(position)
                     wait_for_position(symbol)
                     remove_position(symbol)
-
                     continue
 
-                # Breakeven activation
-                breakeven_active = bool(
+                armed = bool(
                     state["breakeven_done"]
                 )
 
                 if (
-                    not breakeven_active
-                    and BREAKEVEN_TRIGGER_ROI_PCT > 0
-                    and roi >= BREAKEVEN_TRIGGER_ROI_PCT
+                    not armed
+                    and BE_TRIGGER > 0
+                    and roi >= BE_TRIGGER
                 ):
-                    update_breakeven(symbol)
+                    with DB_LOCK, db() as conn:
+                        conn.execute("""
+                            UPDATE position_state
+                            SET breakeven_done=1
+                            WHERE symbol=?
+                        """, (symbol,))
 
-                    breakeven_active = True
+                    armed = True
 
                     log.warning(
-                        "BREAKEVEN ARMED "
-                        "%s ROI=%.2f",
-                        symbol,
-                        roi
+                        "BREAKEVEN ARMED %s",
+                        symbol
                     )
 
-                # Breakeven exit
-                if (
-                    breakeven_active
-                    and roi <= BREAKEVEN_STOP_ROI_PCT
-                ):
-
+                if armed and roi <= BE_STOP:
                     log.warning(
-                        "BREAKEVEN EXIT "
-                        "%s ROI=%.2f",
+                        "BREAKEVEN EXIT %s ROI=%.2f",
                         symbol,
                         roi
                     )
@@ -1558,11 +1518,6 @@ def monitor_risk():
                     close_position(position)
                     wait_for_position(symbol)
                     remove_position(symbol)
-
-                    continue
-
-                # No automatic Railway take profits.
-                # TradingView controls TP1-TP5.
 
             except Exception:
                 log.exception(
@@ -1572,12 +1527,15 @@ def monitor_risk():
 
 
 def risk_worker():
-
     log.info(
-        "RISK MONITOR STARTED"
+        "RISK MONITOR STARTED "
+        "interval=%ss",
+        POLL_SECONDS
     )
 
     while True:
+        started = time.monotonic()
+
         try:
             monitor_risk()
 
@@ -1586,48 +1544,37 @@ def risk_worker():
                 "Risk monitor cycle failed"
             )
 
+        elapsed = (
+            time.monotonic() - started
+        )
+
         time.sleep(
-            POLL_INTERVAL_SECONDS
+            max(
+                1,
+                POLL_SECONDS - elapsed
+            )
         )
 
 
 # ============================================================
-# CLEANUP WORKER
-# ============================================================
-
-def cleanup_worker():
-
-    while True:
-        try:
-            if ENABLE_LIVE_ORDERS:
-                reconcile_flat_positions()
-
-        except Exception:
-            log.exception(
-                "Position cleanup error"
-            )
-
-        time.sleep(60)
-
-
-# ============================================================
-# STATUS
+# HEALTH AND STATUS
 # ============================================================
 
 @app.route("/", methods=["GET"])
 def health():
     return jsonify(
         status="ok",
-        bot="MAQ Futures TP Ladder",
-        live=ENABLE_LIVE_ORDERS,
-        testnet=BINANCE_TESTNET
+        bot="MAQ Optimized Futures Bot",
+        live=LIVE,
+        testnet=TESTNET,
+        poll_seconds=POLL_SECONDS
     )
 
 
 @app.route("/status", methods=["GET"])
 def status():
 
-    with DB_LOCK, database() as conn:
+    with DB_LOCK, db() as conn:
 
         alerts = conn.execute("""
             SELECT status, COUNT(*) AS count
@@ -1639,27 +1586,27 @@ def status():
             SELECT
                 b.symbol,
                 b.direction,
-                b.strategy,
                 s.entry_price,
                 s.entry_qty,
                 s.tp_count,
                 s.breakeven_done
             FROM bot_positions b
             LEFT JOIN position_state s
-                ON b.symbol=s.symbol
+            ON b.symbol=s.symbol
         """).fetchall()
 
     return jsonify(
-        bot="MAQ Futures TP Ladder",
-        live=ENABLE_LIVE_ORDERS,
-        testnet=BINANCE_TESTNET,
-        order_margin_usdt=ORDER_MARGIN_USDT,
-        leverage=ENTRY_LEVERAGE,
-        initial_sl_roi=INITIAL_STOP_LOSS_ROI_PCT,
-        breakeven_trigger_roi=BREAKEVEN_TRIGGER_ROI_PCT,
-        breakeven_stop_roi=BREAKEVEN_STOP_ROI_PCT,
-        partial_dedup_seconds=PARTIAL_DEDUP_SECONDS,
-        risk_type="software_polling",
+        live=LIVE,
+        testnet=TESTNET,
+        poll_seconds=POLL_SECONDS,
+        api_cooldown_remaining=max(
+            0,
+            int(API_PAUSE_UNTIL - time.time())
+        ),
+        initial_sl_roi=INITIAL_SL,
+        breakeven_trigger_roi=BE_TRIGGER,
+        breakeven_stop_roi=BE_STOP,
+        stop_type="software",
         alert_status={
             row["status"]: row["count"]
             for row in alerts
@@ -1672,7 +1619,7 @@ def status():
 
 
 # ============================================================
-# START
+# START WORKERS
 # ============================================================
 
 threading.Thread(
@@ -1685,12 +1632,6 @@ threading.Thread(
     target=risk_worker,
     daemon=True,
     name="MAQ-Risk"
-).start()
-
-threading.Thread(
-    target=cleanup_worker,
-    daemon=True,
-    name="MAQ-Cleanup"
 ).start()
 
 
