@@ -1,34 +1,3 @@
-import os, re, time, json, hmac, sqlite3, hashlib, logging, threading
-from decimal import Decimal, ROUND_DOWN
-from flask import Flask, request, jsonify
-from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger('MAQ')
-app = Flask(__name__)
-
-def setting(name, default):
-    value = os.getenv(name)
-    return str(default) if value is None else value.strip()
-
-def number(name, default, blank_zero=False):
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return 0.0 if blank_zero else float(default)
-    try:
-        return float(value.strip())
-    except ValueError:
-        raise ValueError(f'Invalid Railway variable {name}: expected a number')
-
-def boolean(name, default=False):
-    return setting(name, str(default)).lower() in ('true', '1', 'yes', 'on')
-
-LIVE = boolean('ENABLE_LIVE_ORDERS', False)
-TESTNET = boolean('BINANCE_TESTNET', False)
-KEY = setting('BINANCE_API_KEY', '')
-SECRET = setting('BINANCE_API_SECRET', '')
-WEBHOOK_SECRET = setting('WEBHOOK_SECRET', '')
 MARGIN = number('ORDER_MARGIN_USDT', 50)
 LEVERAGE = int(number('ENTRY_LEVERAGE', 16))
 INITIAL_SL = number('INITIAL_STOP_LOSS_ROI_PCT', 0, blank_zero=True)
@@ -93,3 +62,99 @@ def init_db():
 
         existing_alert_cols = {x[1] for x in c.execute('PRAGMA table_info(alerts)')}
         if 'retry_count' not in existing_alert_cols:
+            c.execute('ALTER TABLE alerts ADD COLUMN retry_count INTEGER DEFAULT 0')
+        if 'next_attempt' not in existing_alert_cols:
+            c.execute('ALTER TABLE alerts ADD COLUMN next_attempt REAL DEFAULT 0')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_positions (
+          symbol TEXT PRIMARY KEY,
+          direction TEXT,
+          created_at REAL,
+          strategy TEXT DEFAULT 'VWAP'
+        )''')
+
+        c.execute('''CREATE TABLE IF NOT EXISTS position_state (
+          symbol TEXT PRIMARY KEY,
+          entry_price REAL,
+          entry_qty REAL,
+          partial_done INTEGER DEFAULT 0,
+          breakeven_done INTEGER DEFAULT 0,
+          tp_count INTEGER DEFAULT 0
+        )''')
+
+        for table, col, definition in (
+            ('bot_positions', 'strategy', "TEXT DEFAULT 'VWAP'"),
+            ('position_state', 'tp_count', 'INTEGER DEFAULT 0'),
+            ('position_state', 'partial_done', 'INTEGER DEFAULT 0'),
+            ('position_state', 'breakeven_done', 'INTEGER DEFAULT 0'),
+            ('position_state', 'entry_price', 'REAL'),
+            ('position_state', 'entry_qty', 'REAL')
+        ):
+            names = {
+                x[1] for x in c.execute(f'PRAGMA table_info({table})')
+            }
+            if col not in names:
+                c.execute(
+                    f'ALTER TABLE {table} ADD COLUMN {col} {definition}'
+                )
+
+        c.execute('''CREATE TABLE IF NOT EXISTS trade_journal (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          symbol TEXT NOT NULL,
+          action TEXT NOT NULL,
+          alert_id INTEGER,
+          client_id TEXT UNIQUE,
+          status TEXT NOT NULL,
+          before_qty REAL,
+          requested_qty REAL,
+          order_id TEXT,
+          created_at REAL,
+          updated_at REAL,
+          note TEXT
+        )''')
+
+        c.execute('''CREATE INDEX IF NOT EXISTS journal_symbol_status
+                     ON trade_journal(symbol,status)''')
+
+        c.execute(
+            """UPDATE alerts
+               SET status='needs_review',
+                   error='Interrupted; inspect Binance and journal',
+                   updated_at=?
+               WHERE status='processing'""",
+            (time.time(),)
+        )
+
+        c.execute(
+            """UPDATE trade_journal
+               SET status='uncertain',
+                   note='Process restarted during order',
+                   updated_at=?
+               WHERE status IN ('submitting','submitted')""",
+            (time.time(),)
+        )
+
+
+init_db()
+
+
+def api(method, **kwargs):
+    global _client, cooldown_until
+
+    with API_LOCK:
+        remaining = cooldown_until - time.time()
+
+        if remaining > 0:
+            raise RuntimeError(
+                f'Binance cooldown active ({remaining:.0f}s)'
+            )
+
+        try:
+            if _client is None:
+                # Compatible with installed python-binance versions.
+                # Do not pass ping=False.
+                _client = Client(
+                    KEY,
+                    SECRET,
+                    testnet=TESTNET
+                )
