@@ -2,8 +2,8 @@
 import os
 import re
 import time
-import json
 import hmac
+import json
 import sqlite3
 import hashlib
 import logging
@@ -12,102 +12,125 @@ from decimal import Decimal, ROUND_DOWN
 
 from flask import Flask, request, jsonify
 from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
-
+from binance.exceptions import (
+    BinanceAPIException,
+    BinanceRequestException
+)
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
+    format="%(asctime)s %(levelname)s %(message)s"
 )
-log = logging.getLogger('MAQ')
+
+log = logging.getLogger("MAQ")
 app = Flask(__name__)
 
 
-# ============================================================
+# ==========================================================
 # CONFIGURATION
-# ============================================================
+# ==========================================================
 
-def setting(name, default=''):
+def setting(name, default=""):
     value = os.getenv(name)
     return str(default) if value is None else value.strip()
 
 
 def number(name, default, blank_zero=False):
     value = setting(name, default)
-    if not value:
+    if value == "":
         return 0.0 if blank_zero else float(default)
     return float(value)
 
 
 def boolean(name, default=False):
     return setting(name, str(default)).lower() in (
-        'true', '1', 'yes', 'on'
+        "true", "1", "yes", "on"
     )
 
 
-LIVE = boolean('ENABLE_LIVE_ORDERS', False)
-TESTNET = boolean('BINANCE_TESTNET', False)
+LIVE = boolean("ENABLE_LIVE_ORDERS", False)
+TESTNET = boolean("BINANCE_TESTNET", False)
 
-KEY = setting('BINANCE_API_KEY')
-SECRET = setting('BINANCE_API_SECRET')
-WEBHOOK_SECRET = setting('WEBHOOK_SECRET')
+KEY = setting("BINANCE_API_KEY")
+SECRET = setting("BINANCE_API_SECRET")
+WEBHOOK_SECRET = setting("WEBHOOK_SECRET")
 
-MARGIN = number('ORDER_MARGIN_USDT', 50)
-LEVERAGE = int(number('ENTRY_LEVERAGE', 16))
-
-# Blank means initial stop loss DISABLED.
-INITIAL_SL = number(
-    'INITIAL_STOP_LOSS_ROI_PCT', 0, blank_zero=True
+# Allows existing TradingView URLs without a secret.
+# WARNING: This permits unauthenticated trade alerts.
+ALLOW_LEGACY_WEBHOOK = boolean(
+    "ALLOW_LEGACY_WEBHOOK", False
 )
 
-BE_TRIGGER = number('BREAKEVEN_TRIGGER_ROI_PCT', 10)
-BE_STOP = number('BREAKEVEN_STOP_ROI_PCT', 0)
+MARGIN = number("ORDER_MARGIN_USDT", 50)
+LEVERAGE = int(number("ENTRY_LEVERAGE", 16))
+
+# Blank or zero = no initial stop loss.
+INITIAL_SL = number(
+    "INITIAL_STOP_LOSS_ROI_PCT",
+    0,
+    blank_zero=True
+)
+
+BE_TRIGGER = number(
+    "BREAKEVEN_TRIGGER_ROI_PCT", 10
+)
+
+BE_STOP = number(
+    "BREAKEVEN_STOP_ROI_PCT", 0
+)
 
 POLL = max(
     30,
-    int(number('POLL_INTERVAL_SECONDS', 60))
+    int(number("POLL_INTERVAL_SECONDS", 60))
 )
 
 DEDUP = max(
     1,
-    int(number('PARTIAL_DEDUP_SECONDS', 15))
+    int(number("PARTIAL_DEDUP_SECONDS", 15))
 )
 
 MAX_AGE = max(
     30,
-    int(number('MAX_ALERT_AGE_SECONDS', 180))
+    int(number("MAX_ALERT_AGE_SECONDS", 180))
 )
 
 DB_PATH = setting(
-    'BOT_DB_PATH', '/data/maq_bot.sqlite3'
+    "BOT_DB_PATH",
+    "/data/maq_bot.sqlite3"
 )
 
-POSITION_CACHE_TTL = 5.0
-
-if LIVE and not (KEY and SECRET and WEBHOOK_SECRET):
+if LIVE and not (KEY and SECRET):
     raise RuntimeError(
-        'Live trading requires Binance credentials '
-        'and WEBHOOK_SECRET'
+        "Live trading requires Binance API credentials"
+    )
+
+if LIVE and not (
+    WEBHOOK_SECRET or ALLOW_LEGACY_WEBHOOK
+):
+    raise RuntimeError(
+        "Configure WEBHOOK_SECRET or explicitly enable "
+        "ALLOW_LEGACY_WEBHOOK"
+    )
+
+if ALLOW_LEGACY_WEBHOOK:
+    log.warning(
+        "SECURITY WARNING: Legacy webhook enabled. "
+        "Unauthenticated alerts can submit trades."
     )
 
 if (
     MARGIN <= 0
-    or not 1 <= LEVERAGE <= 125
+    or LEVERAGE < 1
+    or LEVERAGE > 125
     or INITIAL_SL < 0
     or BE_TRIGGER < 0
 ):
-    raise RuntimeError('Invalid trading configuration')
-
-if not WEBHOOK_SECRET:
-    log.warning(
-        'WEBHOOK_SECRET unset: webhook refuses requests '
-        'until configured'
-    )
+    raise RuntimeError("Invalid trading settings")
 
 
-# ============================================================
-# LOCKS AND CACHES
-# ============================================================
+# ==========================================================
+# LOCKS AND DATABASE
+# ==========================================================
 
 DB_LOCK = threading.RLock()
 TRADE_LOCK = threading.RLock()
@@ -119,31 +142,24 @@ cooldown_until = 0.0
 exchange_cache = {}
 exchange_cache_at = 0.0
 
-snapshot_cache = None
-snapshot_at = 0.0
-
 os.makedirs(
-    os.path.dirname(DB_PATH) or '.',
+    os.path.dirname(DB_PATH) or ".",
     exist_ok=True
 )
 
 
-# ============================================================
-# SQLITE DATABASE
-# ============================================================
-
 def db():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
-    c.execute('PRAGMA busy_timeout=30000')
-    c.execute('PRAGMA journal_mode=WAL')
+    c.execute("PRAGMA busy_timeout=30000")
+    c.execute("PRAGMA journal_mode=WAL")
     return c
 
 
 def init_db():
     with DB_LOCK, db() as c:
 
-        c.execute('''
+        c.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fingerprint TEXT UNIQUE,
@@ -157,18 +173,18 @@ def init_db():
                 retry_count INTEGER DEFAULT 0,
                 next_attempt REAL DEFAULT 0
             )
-        ''')
+        """)
 
-        c.execute('''
+        c.execute("""
             CREATE TABLE IF NOT EXISTS bot_positions (
                 symbol TEXT PRIMARY KEY,
                 direction TEXT,
                 created_at REAL,
                 strategy TEXT DEFAULT 'VWAP'
             )
-        ''')
+        """)
 
-        c.execute('''
+        c.execute("""
             CREATE TABLE IF NOT EXISTS position_state (
                 symbol TEXT PRIMARY KEY,
                 entry_price REAL,
@@ -177,9 +193,9 @@ def init_db():
                 breakeven_done INTEGER DEFAULT 0,
                 tp_count INTEGER DEFAULT 0
             )
-        ''')
+        """)
 
-        c.execute('''
+        c.execute("""
             CREATE TABLE IF NOT EXISTS trade_journal (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
@@ -194,99 +210,63 @@ def init_db():
                 updated_at REAL,
                 note TEXT
             )
-        ''')
+        """)
 
-        columns = (
-            (
-                'alerts',
-                'retry_count',
-                'INTEGER DEFAULT 0'
-            ),
-            (
-                'alerts',
-                'next_attempt',
-                'REAL DEFAULT 0'
-            ),
-            (
-                'bot_positions',
-                'strategy',
-                "TEXT DEFAULT 'VWAP'"
-            ),
-            (
-                'position_state',
-                'tp_count',
-                'INTEGER DEFAULT 0'
-            ),
-            (
-                'position_state',
-                'partial_done',
-                'INTEGER DEFAULT 0'
-            ),
-            (
-                'position_state',
-                'breakeven_done',
-                'INTEGER DEFAULT 0'
-            ),
-            (
-                'position_state',
-                'entry_price',
-                'REAL'
-            ),
-            (
-                'position_state',
-                'entry_qty',
-                'REAL'
-            )
+        migrations = (
+            ("alerts", "retry_count", "INTEGER DEFAULT 0"),
+            ("alerts", "next_attempt", "REAL DEFAULT 0"),
+            ("bot_positions", "strategy", "TEXT DEFAULT 'VWAP'"),
+            ("position_state", "tp_count", "INTEGER DEFAULT 0"),
+            ("position_state", "partial_done", "INTEGER DEFAULT 0"),
+            ("position_state", "breakeven_done", "INTEGER DEFAULT 0"),
+            ("position_state", "entry_price", "REAL"),
+            ("position_state", "entry_qty", "REAL")
         )
 
-        for table, col, definition in columns:
-            names = {
-                r[1]
-                for r in c.execute(
-                    f'PRAGMA table_info({table})'
+        for table, col, definition in migrations:
+            existing = {
+                x[1]
+                for x in c.execute(
+                    f"PRAGMA table_info({table})"
                 )
             }
 
-            if col not in names:
+            if col not in existing:
                 c.execute(
-                    f'ALTER TABLE {table} '
-                    f'ADD COLUMN {col} {definition}'
+                    f"ALTER TABLE {table} ADD COLUMN "
+                    f"{col} {definition}"
                 )
 
-        c.execute('''
+        c.execute("""
             CREATE INDEX IF NOT EXISTS journal_symbol_status
             ON trade_journal(symbol, status)
-        ''')
+        """)
 
-        c.execute(
-            """
+        now = time.time()
+
+        c.execute("""
             UPDATE alerts
             SET status='needs_review',
-                error='Interrupted on restart',
+                error='Interrupted by restart',
                 updated_at=?
             WHERE status='processing'
-            """,
-            (time.time(),)
-        )
+        """, (now,))
 
-        c.execute(
-            """
+        c.execute("""
             UPDATE trade_journal
             SET status='uncertain',
-                note='Restart during submission',
+                note='Interrupted by restart',
                 updated_at=?
             WHERE status IN ('submitting', 'submitted')
-            """,
-            (time.time(),)
-        )
+        """, (now,))
 
 
 init_db()
 
 
-# ============================================================
+# ==========================================================
 # BINANCE API
-# ============================================================
+# ==========================================================
 
 def api(method, **kwargs):
     global _client, cooldown_until
@@ -297,7 +277,7 @@ def api(method, **kwargs):
 
         if remaining > 0:
             raise RuntimeError(
-                f'Binance API cooldown {remaining:.0f}s'
+                f"Binance cooldown active: {remaining:.0f}s"
             )
 
         try:
@@ -319,92 +299,54 @@ def api(method, **kwargs):
                 cooldown_until = time.time() + 120
 
             log.error(
-                'Binance %s error %s: %s',
-                method,
-                exc.code,
-                exc
+                "Binance API %s error %s: %s",
+                method, exc.code, exc
             )
-
             raise
 
-        except (
-            BinanceRequestException,
-            TimeoutError,
-            ConnectionError
-        ) as exc:
-
+        except Exception as exc:
             log.error(
-                'Binance %s network error: %s',
-                method,
-                exc
+                "Binance request %s failed: %s",
+                method, exc
             )
-
             raise
 
 
-# ============================================================
-# POSITION SNAPSHOTS
-# ============================================================
+def positions():
+    raw = api("futures_position_information")
+    result = {}
 
-def positions(force=False):
-    global snapshot_cache, snapshot_at
+    for p in raw:
+        qty = float(p.get("positionAmt", 0))
 
-    with API_LOCK:
+        if qty == 0:
+            continue
 
-        if (
-            not force
-            and snapshot_cache is not None
-            and time.time() - snapshot_at < POSITION_CACHE_TTL
-        ):
-            return snapshot_cache
+        symbol = p["symbol"]
 
-        raw = api('futures_position_information')
-        data = {}
+        if symbol in result:
+            raise RuntimeError(
+                "Hedge mode not supported. "
+                "Use Binance one-way position mode."
+            )
 
-        for p in raw:
+        result[symbol] = {
+            "qty": qty,
+            "entry": float(p.get("entryPrice", 0)),
+            "mark": float(p.get("markPrice", 0)),
+            "side": "LONG" if qty > 0 else "SHORT"
+        }
 
-            qty = float(p.get('positionAmt', 0))
-
-            if abs(qty) > 0:
-
-                symbol = p['symbol']
-
-                if symbol in data:
-                    raise RuntimeError(
-                        'Hedge mode detected; '
-                        'this bot requires one-way position mode'
-                    )
-
-                data[symbol] = {
-                    'qty': qty,
-                    'entry': float(
-                        p.get('entryPrice', 0)
-                    ),
-                    'mark': float(
-                        p.get('markPrice', 0)
-                    ),
-                    'side': (
-                        'LONG' if qty > 0 else 'SHORT'
-                    )
-                }
-
-        snapshot_cache = data
-        snapshot_at = time.time()
-
-        return data
+    return result
 
 
-def invalidate_positions():
-    global snapshot_cache, snapshot_at
-
-    with API_LOCK:
-        snapshot_cache = None
-        snapshot_at = 0.0
+def get_position(symbol):
+    return positions().get(symbol)
 
 
-# ============================================================
-# EXCHANGE QUANTITY RULES
-# ============================================================
+# ==========================================================
+# EXCHANGE RULES
+# ==========================================================
 
 def rules(symbol):
     global exchange_cache, exchange_cache_at
@@ -415,511 +357,368 @@ def rules(symbol):
             not exchange_cache
             or time.time() - exchange_cache_at > 21600
         ):
-
-            info = api('futures_exchange_info')
+            info = api("futures_exchange_info")
 
             exchange_cache = {
-                x['symbol']: x
-                for x in info['symbols']
+                x["symbol"]: x
+                for x in info["symbols"]
             }
 
             exchange_cache_at = time.time()
 
         info = exchange_cache.get(symbol)
 
-        if not info or info.get('status') != 'TRADING':
+        if not info or info.get("status") != "TRADING":
             raise ValueError(
-                f'{symbol} not a trading futures symbol'
+                f"{symbol} is not an active futures symbol"
             )
 
-        lot = next(
-            (
-                x for x in info['filters']
-                if x['filterType'] == 'LOT_SIZE'
-            ),
-            None
-        )
+        filters = {
+            f["filterType"]: f
+            for f in info["filters"]
+        }
 
-        market = next(
-            (
-                x for x in info['filters']
-                if x['filterType'] == 'MARKET_LOT_SIZE'
-            ),
-            None
-        )
+        market = filters.get("MARKET_LOT_SIZE")
+        lot = filters.get("LOT_SIZE")
 
         f = (
             market
-            if (
-                market
-                and float(
-                    market.get('stepSize', 0)
-                ) > 0
-            )
+            if market
+            and float(market.get("stepSize", 0)) > 0
             else lot
         )
 
         if not f:
             raise RuntimeError(
-                f'Missing quantity filter for {symbol}'
+                f"No quantity rules for {symbol}"
             )
 
         return (
-            Decimal(f['stepSize']),
-            Decimal(f['minQty']),
-            Decimal(
-                f.get('maxQty', '999999999')
-            )
+            Decimal(f["stepSize"]),
+            Decimal(f["minQty"]),
+            Decimal(f.get("maxQty", "999999999"))
         )
 
 
-def floor_qty(value, step):
+def format_qty(symbol, value):
+    step, minimum, maximum = rules(symbol)
 
     value = Decimal(str(value))
 
-    return (
+    qty = (
         (value / step).to_integral_value(
             rounding=ROUND_DOWN
         ) * step
     )
 
-
-def quantity(symbol, value):
-
-    step, minimum, maximum = rules(symbol)
-
-    qty = floor_qty(value, step)
-
     if qty < minimum or qty > maximum:
         raise ValueError(
-            f'Quantity {qty} outside '
-            f'[{minimum}, {maximum}] for {symbol}'
+            f"Invalid {symbol} quantity: {qty}"
         )
 
-    return format(qty, 'f')
+    return format(qty, "f")
 
 
-# ============================================================
-# BOT POSITION OWNERSHIP
-# ============================================================
+# ==========================================================
+# BOT OWNERSHIP
+# ==========================================================
 
 def owned(symbol):
-
     with DB_LOCK, db() as c:
 
-        row = c.execute(
-            'SELECT * FROM bot_positions WHERE symbol=?',
+        owner = c.execute(
+            "SELECT * FROM bot_positions WHERE symbol=?",
             (symbol,)
         ).fetchone()
 
         state = c.execute(
-            'SELECT * FROM position_state WHERE symbol=?',
+            "SELECT * FROM position_state WHERE symbol=?",
             (symbol,)
         ).fetchone()
 
         return (
-            dict(row) if row else None,
+            dict(owner) if owner else None,
             dict(state) if state else None
         )
 
 
-def save_owned(
-    symbol,
-    side,
-    entry,
-    qty,
-    strategy
-):
-
+def save_owned(symbol, direction, p, strategy):
     with DB_LOCK, db() as c:
 
-        c.execute(
-            '''
+        c.execute("""
             INSERT OR REPLACE INTO bot_positions
             (symbol, direction, created_at, strategy)
             VALUES (?, ?, ?, ?)
-            ''',
-            (
-                symbol,
-                side,
-                time.time(),
-                strategy
-            )
-        )
+        """, (
+            symbol,
+            direction,
+            time.time(),
+            strategy
+        ))
 
-        c.execute(
-            '''
+        c.execute("""
             INSERT OR REPLACE INTO position_state
             (
-                symbol,
-                entry_price,
-                entry_qty,
-                partial_done,
-                breakeven_done,
-                tp_count
+                symbol, entry_price, entry_qty,
+                partial_done, breakeven_done, tp_count
             )
             VALUES (?, ?, ?, 0, 0, 0)
-            ''',
-            (
-                symbol,
-                entry,
-                abs(qty)
-            )
-        )
+        """, (
+            symbol,
+            p["entry"],
+            abs(p["qty"])
+        ))
 
 
 def forget_owned(symbol):
-
     with DB_LOCK, db() as c:
 
         c.execute(
-            'DELETE FROM bot_positions WHERE symbol=?',
+            "DELETE FROM bot_positions WHERE symbol=?",
             (symbol,)
         )
 
         c.execute(
-            'DELETE FROM position_state WHERE symbol=?',
+            "DELETE FROM position_state WHERE symbol=?",
             (symbol,)
         )
 
 
-# ============================================================
+# ==========================================================
 # ORDER JOURNAL
-# ============================================================
+# ==========================================================
 
 def unresolved(symbol):
-
     with DB_LOCK, db() as c:
 
-        return c.execute(
-            """
+        row = c.execute("""
             SELECT *
             FROM trade_journal
             WHERE symbol=?
               AND status IN (
-                'submitting',
-                'submitted',
-                'uncertain'
+                'submitting', 'submitted', 'uncertain'
               )
             ORDER BY id DESC
             LIMIT 1
-            """,
-            (symbol,)
-        ).fetchone()
+        """, (symbol,)).fetchone()
+
+        return dict(row) if row else None
 
 
-def journal_new(
-    symbol,
-    action,
-    alert_id,
-    before,
-    requested
+def journal_create(
+    symbol, action, alert_id, before_qty, qty
 ):
-
     with DB_LOCK, db() as c:
 
-        cursor = c.execute(
-            '''
+        cur = c.execute("""
             INSERT INTO trade_journal
             (
-                symbol,
-                action,
-                alert_id,
-                status,
-                before_qty,
-                requested_qty,
-                created_at,
-                updated_at
+                symbol, action, alert_id, status,
+                before_qty, requested_qty,
+                created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''',
-            (
-                symbol,
-                action,
-                alert_id,
-                'prepared',
-                before,
-                requested,
-                time.time(),
-                time.time()
-            )
-        )
+            VALUES (?, ?, ?, 'prepared', ?, ?, ?, ?)
+        """, (
+            symbol,
+            action,
+            alert_id,
+            before_qty,
+            float(qty),
+            time.time(),
+            time.time()
+        ))
 
-        jid = cursor.lastrowid
+        jid = cur.lastrowid
+        cid = f"MAQ{jid}_{int(time.time())}"
 
-        client_id = (
-            f'MAQ{jid}_{int(time.time())}'
-        )
-
-        c.execute(
-            '''
+        c.execute("""
             UPDATE trade_journal
             SET client_id=?
             WHERE id=?
-            ''',
-            (client_id, jid)
-        )
+        """, (cid, jid))
 
-        return jid, client_id
+        return jid, cid
 
 
 def journal_update(
-    jid,
-    status,
-    order_id=None,
-    note=None
+    jid, status, order_id=None, note=None
 ):
-
     with DB_LOCK, db() as c:
 
-        c.execute(
-            '''
+        c.execute("""
             UPDATE trade_journal
             SET status=?,
                 order_id=COALESCE(?, order_id),
                 note=COALESCE(?, note),
                 updated_at=?
             WHERE id=?
-            ''',
-            (
-                status,
-                (
-                    str(order_id)
-                    if order_id is not None
-                    else None
-                ),
-                note,
-                time.time(),
-                jid
-            )
-        )
+        """, (
+            status,
+            str(order_id) if order_id is not None else None,
+            note,
+            time.time(),
+            jid
+        ))
 
 
-# ============================================================
-# ORDER SUBMISSION
-# ============================================================
+# ==========================================================
+# MARKET ORDERS
+# ==========================================================
 
-def submit(
-    symbol,
-    side,
-    qty,
-    reduce_only,
-    action,
-    alert_id,
-    before
+def submit_order(
+    symbol, side, qty, reduce_only,
+    action, alert_id, before_qty
 ):
-
     if not LIVE:
-        raise RuntimeError(
-            'Live trading disabled'
-        )
+        raise RuntimeError("Live orders disabled")
 
     if unresolved(symbol):
         raise RuntimeError(
-            f'{symbol}: unresolved order journal; '
-            'manual reconciliation required'
+            f"{symbol}: unresolved order requires review"
         )
 
-    jid, cid = journal_new(
+    jid, cid = journal_create(
         symbol,
         action,
         alert_id,
-        before,
-        float(qty)
+        before_qty,
+        qty
     )
 
-    journal_update(jid, 'submitting')
+    journal_update(jid, "submitting")
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty,
+        "newClientOrderId": cid
+    }
+
+    if reduce_only:
+        params["reduceOnly"] = "true"
 
     try:
-
-        params = {
-            'symbol': symbol,
-            'side': side,
-            'type': 'MARKET',
-            'quantity': qty,
-            'newClientOrderId': cid
-        }
-
-        if reduce_only:
-            params['reduceOnly'] = 'true'
-
         order = api(
-            'futures_create_order',
+            "futures_create_order",
             **params
         )
 
         journal_update(
             jid,
-            'submitted',
-            order.get('orderId')
+            "submitted",
+            order.get("orderId")
         )
 
-        invalidate_positions()
-
-        return jid, order
+        return jid
 
     except BinanceAPIException as exc:
 
+        # Only known definite rejections are marked rejected.
+        # Ambiguous outcomes must not be blindly retried.
         if exc.code in (
-            -1013,
-            -1100,
-            -1102,
-            -1111,
-            -2019,
-            -2021,
-            -2022,
-            -4164
+            -1013, -1100, -1102, -1111,
+            -2019, -2021, -2022, -4164
         ):
-
             journal_update(
-                jid,
-                'rejected',
-                note=str(exc)
+                jid, "rejected", note=str(exc)
             )
-
         else:
-
             journal_update(
-                jid,
-                'uncertain',
-                note=str(exc)
+                jid, "uncertain", note=str(exc)
             )
 
         raise
 
     except Exception as exc:
-
         journal_update(
-            jid,
-            'uncertain',
-            note=str(exc)
+            jid, "uncertain", note=str(exc)
         )
-
         raise
 
 
-# ============================================================
-# VERIFY EXCHANGE POSITION
-# ============================================================
+def confirm_position(jid, symbol, predicate):
+    last_error = None
 
-def verified(
-    symbol,
-    predicate,
-    attempts=4
-):
-
-    for attempt in range(attempts):
-
+    for attempt in range(4):
         if attempt:
-            time.sleep(1.0)
+            time.sleep(1)
 
-        p = positions(
-            force=True
-        ).get(symbol)
+        try:
+            p = get_position(symbol)
 
-        if predicate(p):
-            return p
+            if predicate(p):
+                journal_update(jid, "confirmed")
+                return p
 
-    raise RuntimeError(
-        f'{symbol}: exchange state not verified; '
-        'inspect orders before retrying'
-    )
-
-
-def confirm_order(
-    jid,
-    symbol,
-    predicate
-):
-
-    try:
-
-        p = verified(
-            symbol,
-            predicate
-        )
-
-    except Exception as exc:
-
-        journal_update(
-            jid,
-            'uncertain',
-            note=str(exc)
-        )
-
-        raise
+        except Exception as exc:
+            last_error = exc
 
     journal_update(
         jid,
-        'confirmed'
+        "uncertain",
+        note=(
+            str(last_error)
+            if last_error
+            else "Position confirmation failed"
+        )
     )
 
-    return p
+    raise RuntimeError(
+        f"{symbol}: exchange state not confirmed; "
+        "check Binance before another order"
+    )
 
 
-# ============================================================
+# ==========================================================
 # CLOSE POSITION
-# ============================================================
+# ==========================================================
 
 def close_position(
-    symbol,
-    alert_id=None,
-    reason='CLOSE'
+    symbol, alert_id=None, reason="CLOSE"
 ):
-
     with TRADE_LOCK:
 
-        owner, state = owned(symbol)
-
-        p = positions(
-            force=True
-        ).get(symbol)
+        p = get_position(symbol)
+        owner, _ = owned(symbol)
 
         if not p:
-
             if owner:
                 forget_owned(symbol)
-
-            return 'already_flat'
+            return "already_flat"
 
         if (
             not owner
-            or owner['direction'] != p['side']
+            or owner["direction"] != p["side"]
         ):
-
             raise RuntimeError(
-                f'{symbol}: position not verified '
-                'as bot-owned; will not close'
+                f"{symbol}: refusing to close "
+                "unverified or manually owned position"
             )
 
         if unresolved(symbol):
-
             raise RuntimeError(
-                f'{symbol}: unresolved journal'
+                f"{symbol}: unresolved previous order"
             )
 
-        side = (
-            'SELL'
-            if p['qty'] > 0
-            else 'BUY'
-        )
+        side = "SELL" if p["qty"] > 0 else "BUY"
 
-        qty = quantity(
+        qty = format_qty(
             symbol,
-            abs(p['qty'])
+            abs(p["qty"])
         )
 
-        jid, _ = submit(
+        jid = submit_order(
             symbol,
             side,
             qty,
             True,
             reason,
             alert_id,
-            p['qty']
+            p["qty"]
         )
 
-        confirm_order(
+        confirm_position(
             jid,
             symbol,
             lambda x: x is None
@@ -927,344 +726,267 @@ def close_position(
 
         forget_owned(symbol)
 
-        return 'closed'
+        log.info(
+            "%s position closed: %s",
+            symbol, reason
+        )
+
+        return "closed"
 
 
-# ============================================================
-# BUY / SELL / AUTOMATIC REVERSAL
-# ============================================================
+# ==========================================================
+# BUY, SELL AND AUTOMATIC REVERSAL
+# ==========================================================
 
 def enter(
-    symbol,
-    direction,
-    strategy='STANDARD',
-    alert_id=None
+    symbol, direction,
+    strategy="STANDARD", alert_id=None
 ):
-
     with TRADE_LOCK:
 
         if unresolved(symbol):
-
             raise RuntimeError(
-                f'{symbol}: unresolved journal'
+                f"{symbol}: unresolved journal"
             )
 
-        p = positions(
-            force=True
-        ).get(symbol)
-
+        p = get_position(symbol)
         owner, _ = owned(symbol)
 
         if p:
 
             if (
                 not owner
-                or owner['direction'] != p['side']
+                or owner["direction"] != p["side"]
             ):
-
                 raise RuntimeError(
-                    f'{symbol}: existing position '
-                    'not bot-owned; refusing entry'
+                    f"{symbol}: existing position "
+                    "is not verified as bot-owned"
                 )
 
-            if p['side'] == direction:
+            if p["side"] == direction:
+                return "already_in_position"
 
-                return 'already_in_position'
-
-            # Opposite signal:
-            # Close old bot-owned position first.
+            # Reverse only bot-owned positions.
             close_position(
                 symbol,
                 alert_id,
-                'REVERSAL_CLOSE'
+                "REVERSAL_CLOSE"
             )
 
-            if positions(
-                force=True
-            ).get(symbol):
-
+            if get_position(symbol):
                 raise RuntimeError(
-                    f'{symbol}: reversal close '
-                    'not confirmed'
+                    f"{symbol}: reversal close not verified"
                 )
 
         elif owner:
-
             forget_owned(symbol)
 
         api(
-            'futures_change_leverage',
+            "futures_change_leverage",
             symbol=symbol,
             leverage=LEVERAGE
         )
 
         ticker = api(
-            'futures_symbol_ticker',
+            "futures_symbol_ticker",
             symbol=symbol
         )
 
-        price = float(
-            ticker['price']
-        )
+        price = float(ticker["price"])
 
         if price <= 0:
-
             raise RuntimeError(
-                'Invalid market price'
+                "Invalid market price"
             )
 
-        qty = quantity(
+        qty = format_qty(
             symbol,
             MARGIN * LEVERAGE / price
         )
 
         side = (
-            'BUY'
-            if direction == 'LONG'
-            else 'SELL'
+            "BUY" if direction == "LONG"
+            else "SELL"
         )
 
-        jid, _ = submit(
+        jid = submit_order(
             symbol,
             side,
             qty,
             False,
-            'ENTRY_' + direction,
+            "ENTRY_" + direction,
             alert_id,
             0.0
         )
 
-        p = confirm_order(
+        p = confirm_position(
             jid,
             symbol,
             lambda x: (
                 x is not None
-                and x['side'] == direction
+                and x["side"] == direction
             )
         )
 
         save_owned(
             symbol,
             direction,
-            p['entry'],
-            abs(p['qty']),
+            p,
             strategy
         )
 
-        return (
-            'entered_' + direction.lower()
+        log.info(
+            "Entered %s %s",
+            direction, symbol
         )
 
+        return "entered_" + direction.lower()
 
-# ============================================================
-# PARTIAL TAKE PROFIT
-# FIVE STAGES OF 20% OF ORIGINAL POSITION
-# ============================================================
+
+# ==========================================================
+# FIVE TAKE-PROFIT STAGES
+# ==========================================================
 
 def partial(
-    symbol,
-    pct=20,
-    stage=None,
-    alert_id=None
+    symbol, pct=20,
+    stage=None, alert_id=None
 ):
-
     with TRADE_LOCK:
 
         if not 0 < pct <= 100:
-
             raise ValueError(
-                'Partial percent must be '
-                'between 0 and 100'
+                "Partial percentage must be 0-100"
             )
 
-        p = positions(
-            force=True
-        ).get(symbol)
-
+        p = get_position(symbol)
         owner, state = owned(symbol)
 
         if not p:
-
             if owner:
                 forget_owned(symbol)
-
-            return 'already_flat'
+            return "already_flat"
 
         if (
             not owner
             or not state
-            or owner['direction'] != p['side']
+            or owner["direction"] != p["side"]
         ):
-
             raise RuntimeError(
-                f'{symbol}: position not bot-owned'
+                f"{symbol}: not a verified bot position"
             )
 
         if unresolved(symbol):
-
             raise RuntimeError(
-                f'{symbol}: unresolved journal'
+                f"{symbol}: unresolved previous order"
             )
 
-        count = int(
-            state['tp_count'] or 0
-        )
-
-        if stage is not None:
-
-            if stage <= count:
-
-                return 'stage_already_completed'
-
-            if stage != count + 1:
-
-                raise RuntimeError(
-                    f'{symbol}: expected TP{count + 1}, '
-                    f'got TP{stage}'
-                )
+        count = int(state["tp_count"] or 0)
 
         if count >= 5:
+            return "all_take_profits_completed"
 
-            return 'all_stages_completed'
+        if stage is not None:
+            if stage <= count:
+                return "stage_already_completed"
 
-        with DB_LOCK, db() as c:
+            if stage != count + 1:
+                raise RuntimeError(
+                    f"{symbol}: expected TP{count + 1}"
+                )
 
-            recent = c.execute(
-                """
-                SELECT updated_at
-                FROM trade_journal
-                WHERE symbol=?
-                  AND action='PARTIAL'
-                  AND status='confirmed'
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (symbol,)
-            ).fetchone()
+        if stage is None:
+            with DB_LOCK, db() as c:
+                recent = c.execute("""
+                    SELECT updated_at
+                    FROM trade_journal
+                    WHERE symbol=?
+                      AND action='PARTIAL'
+                      AND status='confirmed'
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, (symbol,)).fetchone()
 
-        if (
-            stage is None
-            and recent
-            and time.time()
-            - float(recent['updated_at']) < DEDUP
-        ):
+            if recent and (
+                time.time() - recent["updated_at"] < DEDUP
+            ):
+                return "partial_deduplicated"
 
-            return 'partial_deduplicated'
-
-        initial = float(
-            state['entry_qty'] or 0
+        original = float(
+            state["entry_qty"] or 0
         )
 
-        target = (
-            initial * pct / 100
-        )
+        target = original * pct / 100
 
         if (
-            stage == 5
-            or count == 4
-            or target >= abs(p['qty'])
+            count == 4
+            or stage == 5
+            or target >= abs(p["qty"])
         ):
-
-            qty = quantity(
-                symbol,
-                abs(p['qty'])
+            amount = abs(p["qty"])
+        else:
+            amount = min(
+                target,
+                abs(p["qty"])
             )
 
-        else:
-
-            try:
-
-                qty = quantity(
-                    symbol,
-                    min(
-                        target,
-                        abs(p['qty'])
-                    )
-                )
-
-            except ValueError:
-
-                return (
-                    'quantity_below_exchange_minimum'
-                )
+        qty = format_qty(symbol, amount)
 
         side = (
-            'SELL'
-            if p['qty'] > 0
-            else 'BUY'
+            "SELL" if p["qty"] > 0
+            else "BUY"
         )
 
-        jid, _ = submit(
+        before = abs(p["qty"])
+
+        jid = submit_order(
             symbol,
             side,
             qty,
             True,
-            'PARTIAL',
+            "PARTIAL",
             alert_id,
-            p['qty']
+            p["qty"]
         )
 
-        before = abs(
-            p['qty']
-        )
-
-        after = confirm_order(
+        after = confirm_position(
             jid,
             symbol,
             lambda x: (
                 x is None
-                or abs(x['qty']) < before - 1e-12
+                or abs(x["qty"]) < before - 1e-12
             )
         )
 
         if after is None:
-
             forget_owned(symbol)
-
-            return 'partial_closed_position'
+            return "partial_closed_position"
 
         with DB_LOCK, db() as c:
-
-            c.execute(
-                '''
+            c.execute("""
                 UPDATE position_state
                 SET tp_count=?,
                     partial_done=1
                 WHERE symbol=?
-                ''',
-                (
-                    count + 1,
-                    symbol
-                )
-            )
+            """, (
+                count + 1,
+                symbol
+            ))
 
-        return (
-            f'partial_tp_{count + 1}'
-        )
+        return f"partial_tp_{count + 1}"
 
 
-# ============================================================
-# ROI AND BREAKEVEN MONITOR
-# ============================================================
+# ==========================================================
+# ROI AND BREAKEVEN
+# ==========================================================
 
-def roi(p):
-
-    entry = float(
-        p['entry']
-    )
+def calculate_roi(p):
+    entry = float(p["entry"])
 
     if entry <= 0:
         return None
 
-    mark = float(
-        p['mark']
-    )
-
-    sign = (
-        1
-        if p['qty'] > 0
-        else -1
-    )
+    mark = float(p["mark"])
+    sign = 1 if p["qty"] > 0 else -1
 
     return (
         sign
@@ -1276,386 +998,282 @@ def roi(p):
 
 
 def monitor_once():
-
     if not LIVE:
         return
 
     with TRADE_LOCK:
 
-        ps = positions(
-            force=True
-        )
+        ps = positions()
 
         with DB_LOCK, db() as c:
-
             owners = [
-                dict(r)
-                for r in c.execute(
-                    'SELECT * FROM bot_positions'
+                dict(row)
+                for row in c.execute(
+                    "SELECT * FROM bot_positions"
                 )
             ]
 
         for owner in owners:
-
-            symbol = owner['symbol']
-
+            symbol = owner["symbol"]
             p = ps.get(symbol)
 
             if not p:
-
                 forget_owned(symbol)
                 continue
 
-            if (
-                p['side'] != owner['direction']
-                or unresolved(symbol)
-            ):
-
+            if p["side"] != owner["direction"]:
                 log.error(
-                    'Risk monitor skipped %s: '
-                    'ownership mismatch or unresolved order',
+                    "Position direction mismatch: %s",
                     symbol
                 )
+                continue
 
+            if unresolved(symbol):
+                log.error(
+                    "Unresolved order; monitor skipped %s",
+                    symbol
+                )
                 continue
 
             _, state = owned(symbol)
 
             if not state:
-
                 log.error(
-                    'Risk monitor skipped %s: '
-                    'missing position state',
+                    "Missing position state: %s",
                     symbol
                 )
-
                 continue
 
-            value = roi(p)
+            value = calculate_roi(p)
 
             if value is None:
                 continue
 
-            # Initial stop is disabled when INITIAL_SL = 0.
+            # Disabled when INITIAL_SL is zero.
             if (
                 INITIAL_SL > 0
                 and value <= -INITIAL_SL
             ):
-
-                log.warning(
-                    'Initial SL triggered %s ROI %.2f',
-                    symbol,
-                    value
-                )
-
                 close_position(
                     symbol,
-                    reason='INITIAL_SL'
+                    reason="INITIAL_SL"
                 )
-
                 continue
 
             armed = bool(
-                state['breakeven_done']
+                state["breakeven_done"]
             )
 
             if (
                 not armed
                 and value >= BE_TRIGGER
             ):
-
                 with DB_LOCK, db() as c:
-
-                    c.execute(
-                        '''
+                    c.execute("""
                         UPDATE position_state
                         SET breakeven_done=1
                         WHERE symbol=?
-                        ''',
-                        (symbol,)
-                    )
+                    """, (symbol,))
 
                 armed = True
 
                 log.info(
-                    'Breakeven armed %s ROI %.2f',
-                    symbol,
-                    value
+                    "Breakeven armed %s ROI %.2f",
+                    symbol, value
                 )
 
-            if (
-                armed
-                and value <= BE_STOP
-            ):
-
+            if armed and value <= BE_STOP:
                 log.warning(
-                    'Breakeven exit %s ROI %.2f',
-                    symbol,
-                    value
+                    "Breakeven triggered %s ROI %.2f",
+                    symbol, value
                 )
 
                 close_position(
                     symbol,
-                    reason='BREAKEVEN'
+                    reason="BREAKEVEN"
                 )
 
 
-# ============================================================
-# TRADINGVIEW SIGNAL PARSER
-# ============================================================
+# ==========================================================
+# TRADINGVIEW ALERT PARSER
+# ==========================================================
 
 def parse(message):
-
     if isinstance(message, dict):
-
         message = (
-            message.get('message')
-            or message.get('text')
-            or message.get('alert')
-            or ''
+            message.get("message")
+            or message.get("text")
+            or message.get("alert")
+            or ""
         )
 
     raw = (
         str(message)
         .strip()
         .upper()
-        .replace(' ', '')
+        .replace(" ", "")
     )
 
-    pieces = raw.split('|')
+    parts = raw.split("|")
+    strategy = "STANDARD"
 
-    if (
-        pieces
-        and pieces[0] == 'VWAP'
-    ):
+    if parts and parts[0] == "VWAP":
+        parts = parts[1:]
+        strategy = "VWAP"
 
-        pieces = pieces[1:]
-        strategy = 'VWAP'
-
-    else:
-
-        strategy = 'STANDARD'
-
-    if len(pieces) < 2:
-
+    if len(parts) < 2:
         raise ValueError(
-            'Expected BUY|SYMBOL, SELL|SYMBOL, '
-            'CLOSE|SYMBOL, PARTIAL|SYMBOL|20, '
-            'or VWAP|TP1|SYMBOL'
+            "Expected BUY|SYMBOL or SELL|SYMBOL"
         )
 
-    signal, symbol = pieces[:2]
+    signal = parts[0]
+    symbol = parts[1]
 
     if not re.fullmatch(
-        r'[A-Z0-9]{4,25}',
+        r"[A-Z0-9]{4,25}",
         symbol
     ):
-
-        raise ValueError(
-            'Invalid symbol'
-        )
+        raise ValueError("Invalid symbol")
 
     stage = None
     pct = 20.0
 
-    if re.fullmatch(
-        r'TP[1-5]',
-        signal
-    ):
+    if re.fullmatch(r"TP[1-5]", signal):
+        stage = int(signal[2:])
+        signal = "PARTIAL"
 
-        stage = int(
-            signal[2:]
-        )
-
-        signal = 'PARTIAL'
-
-    elif (
-        signal == 'PARTIAL'
-        and len(pieces) > 2
-    ):
-
-        pct = float(
-            pieces[2]
-        )
+    elif signal == "PARTIAL" and len(parts) > 2:
+        pct = float(parts[2])
 
     elif signal not in (
-        'BUY',
-        'SELL',
-        'CLOSE',
-        'PARTIAL'
+        "BUY", "SELL", "PARTIAL", "CLOSE"
     ):
-
         raise ValueError(
-            'Unknown signal'
+            f"Unsupported signal: {signal}"
         )
 
-    if (
-        signal == 'PARTIAL'
-        and not 0 < pct <= 100
-    ):
-
+    if signal == "PARTIAL" and not 0 < pct <= 100:
         raise ValueError(
-            'Invalid partial percent'
+            "Invalid partial percentage"
         )
 
     return {
-        'signal': signal,
-        'symbol': symbol,
-        'pct': pct,
-        'stage': stage,
-        'strategy': strategy,
-        'raw': raw
+        "signal": signal,
+        "symbol": symbol,
+        "pct": pct,
+        "stage": stage,
+        "strategy": strategy,
+        "raw": raw
     }
 
 
-# ============================================================
-# SIGNAL DISPATCH
-# ============================================================
-
 def dispatch(alert, alert_id):
+    signal = alert["signal"]
+    symbol = alert["symbol"]
 
-    signal = alert['signal']
-    symbol = alert['symbol']
-
-    if signal == 'BUY':
-
+    if signal == "BUY":
         return enter(
             symbol,
-            'LONG',
-            alert['strategy'],
+            "LONG",
+            alert["strategy"],
             alert_id
         )
 
-    if signal == 'SELL':
-
+    if signal == "SELL":
         return enter(
             symbol,
-            'SHORT',
-            alert['strategy'],
+            "SHORT",
+            alert["strategy"],
             alert_id
         )
 
-    if signal == 'CLOSE':
-
+    if signal == "CLOSE":
         return close_position(
             symbol,
             alert_id
         )
 
-    if signal == 'PARTIAL':
-
+    if signal == "PARTIAL":
         return partial(
             symbol,
-            alert['pct'],
-            alert['stage'],
+            alert["pct"],
+            alert["stage"],
             alert_id
         )
 
-    raise ValueError(
-        'Unknown signal'
-    )
+    raise ValueError("Unknown signal")
 
 
-# ============================================================
+# ==========================================================
 # ALERT QUEUE
-# ============================================================
+# ==========================================================
 
 def queue_once():
-
     with DB_LOCK, db() as c:
 
-        row = c.execute(
-            """
+        row = c.execute("""
             SELECT *
             FROM alerts
             WHERE status='pending'
             ORDER BY id
             LIMIT 1
-            """
-        ).fetchone()
+        """).fetchone()
 
         if not row:
             return False
 
-        c.execute(
-            """
+        c.execute("""
             UPDATE alerts
             SET status='processing',
                 updated_at=?
             WHERE id=?
               AND status='pending'
-            """,
-            (
-                time.time(),
-                row['id']
-            )
-        )
+        """, (
+            time.time(),
+            row["id"]
+        ))
 
-    alert_id = row['id']
+    alert_id = row["id"]
 
-    age = (
-        time.time()
-        - float(row['received_at'])
-    )
-
-    if age > MAX_AGE:
-
-        result = 'Expired before processing'
-        status = 'expired'
+    if time.time() - row["received_at"] > MAX_AGE:
+        status = "expired"
+        result = "Alert expired"
 
     elif not LIVE:
-
-        result = (
-            'Dry run: no Binance order placed'
-        )
-
-        status = 'dry_run'
+        status = "dry_run"
+        result = "Live orders disabled"
 
     else:
-
         try:
-
-            alert = parse(
-                row['raw_message']
-            )
-
-            result = dispatch(
-                alert,
-                alert_id
-            )
-
-            status = 'completed'
+            alert = parse(row["raw_message"])
+            result = dispatch(alert, alert_id)
+            status = "completed"
 
         except Exception as exc:
-
             log.exception(
-                'Alert %s failed',
+                "Alert %s failed",
                 alert_id
             )
 
             result = str(exc)
-            status = 'needs_review'
+            status = "needs_review"
 
     with DB_LOCK, db() as c:
-
-        c.execute(
-            '''
+        c.execute("""
             UPDATE alerts
             SET status=?,
                 error=?,
                 updated_at=?
             WHERE id=?
-            ''',
-            (
-                status,
-                result,
-                time.time(),
-                alert_id
-            )
-        )
+        """, (
+            status,
+            result,
+            time.time(),
+            alert_id
+        ))
 
     log.info(
-        'Alert %s: %s %s',
+        "Alert %s: %s - %s",
         alert_id,
         status,
         result
@@ -1665,98 +1283,79 @@ def queue_once():
 
 
 def queue_worker():
-
     while True:
-
         try:
-
             if not queue_once():
                 time.sleep(1)
 
         except Exception:
-
-            log.exception(
-                'Queue worker error'
-            )
-
+            log.exception("Queue worker error")
             time.sleep(5)
 
 
-# ============================================================
-# BACKGROUND RISK MONITOR
-# ============================================================
-
 def risk_worker():
-
     while True:
-
         try:
-
             monitor_once()
 
         except Exception:
-
-            log.exception(
-                'Risk monitor error'
-            )
+            log.exception("Risk monitor error")
 
         time.sleep(POLL)
 
 
-# ============================================================
+# ==========================================================
 # WEBHOOK AUTHENTICATION
-# ============================================================
+# ==========================================================
 
 def secret_ok():
-
-    if not WEBHOOK_SECRET:
-        return False
-
     supplied = (
-        request.args.get('secret', '')
+        request.args.get("secret", "")
         or request.headers.get(
-            'X-Webhook-Secret', ''
+            "X-Webhook-Secret", ""
         )
     )
 
-    return hmac.compare_digest(
-        str(supplied),
-        WEBHOOK_SECRET
-    )
+    # Authenticated requests always require a valid secret.
+    if supplied:
+        return bool(WEBHOOK_SECRET) and hmac.compare_digest(
+            supplied,
+            WEBHOOK_SECRET
+        )
+
+    # Compatibility with existing TradingView alert URLs.
+    return ALLOW_LEGACY_WEBHOOK
 
 
-# ============================================================
+# ==========================================================
 # FLASK ROUTES
-# ============================================================
+# ==========================================================
 
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def home():
-
     return jsonify(
-        service='MAQ Binance Futures Bot',
-        status='running',
+        service="MAQ Binance Futures Bot",
+        status="running",
         live=LIVE,
-        webhook='/webhook',
-        monitoring_seconds=POLL
+        webhook="/webhook",
+        legacy_webhook=ALLOW_LEGACY_WEBHOOK
     )
 
 
-@app.route('/health', methods=['GET'])
+@app.route("/health", methods=["GET"])
 def health():
-
     return jsonify(
         ok=True,
         live=LIVE
     )
 
 
-@app.route('/webhook', methods=['POST'])
+@app.route("/webhook", methods=["POST"])
 def webhook():
 
     if not secret_ok():
-
         return jsonify(
-            error='Unauthorized webhook'
+            error="Unauthorized webhook"
         ), 401
 
     raw = request.get_data(
@@ -1764,10 +1363,7 @@ def webhook():
     ).strip()
 
     try:
-
-        payload = request.get_json(
-            silent=True
-        )
+        payload = request.get_json(silent=True)
 
         content = (
             payload
@@ -1775,36 +1371,27 @@ def webhook():
             else raw
         )
 
-        alert = parse(
-            content
-        )
+        alert = parse(content)
 
-    except (
-        ValueError,
-        TypeError
-    ) as exc:
-
+    except (ValueError, TypeError) as exc:
         return jsonify(
             error=str(exc)
         ), 400
 
     now = time.time()
-
-    # Deduplicate identical alerts in a short window.
-    window = int(
-        now // DEDUP
-    )
+    window = int(now // DEDUP)
 
     fingerprint = hashlib.sha256(
-        f'{alert["raw"]}|{window}'.encode()
+        (
+            alert["raw"]
+            + "|"
+            + str(window)
+        ).encode()
     ).hexdigest()
 
     with DB_LOCK, db() as c:
-
         try:
-
-            cursor = c.execute(
-                '''
+            cursor = c.execute("""
                 INSERT INTO alerts
                 (
                     fingerprint,
@@ -1815,23 +1402,19 @@ def webhook():
                     status,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''',
-                (
-                    fingerprint,
-                    alert['symbol'],
-                    alert['signal'],
-                    alert['raw'],
-                    now,
-                    'pending',
-                    now
-                )
-            )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """, (
+                fingerprint,
+                alert["symbol"],
+                alert["signal"],
+                alert["raw"],
+                now,
+                now
+            ))
 
             alert_id = cursor.lastrowid
 
         except sqlite3.IntegrityError:
-
             return jsonify(
                 ok=True,
                 duplicate=True
@@ -1845,73 +1428,59 @@ def webhook():
     ), 202
 
 
-@app.route('/status', methods=['GET'])
+@app.route("/status", methods=["GET"])
 def status():
 
     if not secret_ok():
-
         return jsonify(
-            error='Unauthorized'
+            error="Unauthorized"
         ), 401
 
     with DB_LOCK, db() as c:
 
         counts = {
-            r['status']: r['n']
-            for r in c.execute(
-                '''
+            r["status"]: r["n"]
+            for r in c.execute("""
                 SELECT status, COUNT(*) AS n
                 FROM alerts
                 GROUP BY status
-                '''
-            )
+            """)
         }
 
         tracked = [
             dict(r)
             for r in c.execute(
-                'SELECT * FROM bot_positions'
+                "SELECT * FROM bot_positions"
             )
         ]
 
         recent = [
             dict(r)
-            for r in c.execute(
-                '''
+            for r in c.execute("""
                 SELECT
-                    id,
-                    symbol,
-                    signal,
-                    status,
-                    error,
-                    received_at
+                    id, symbol, signal,
+                    status, error, received_at
                 FROM alerts
                 ORDER BY id DESC
-                LIMIT 15
-                '''
-            )
+                LIMIT 20
+            """)
         ]
 
         uncertain = [
             dict(r)
-            for r in c.execute(
-                """
+            for r in c.execute("""
                 SELECT
-                    id,
-                    symbol,
-                    action,
-                    status,
-                    client_id
+                    id, symbol, action,
+                    status, client_id
                 FROM trade_journal
                 WHERE status IN (
                     'uncertain',
-                    'submitted',
-                    'submitting'
+                    'submitting',
+                    'submitted'
                 )
                 ORDER BY id DESC
                 LIMIT 20
-                """
-            )
+            """)
         ]
 
     return jsonify(
@@ -1923,38 +1492,35 @@ def status():
         unresolved_orders=uncertain,
         cooldown_remaining=max(
             0,
-            round(
-                cooldown_until - time.time()
-            )
+            round(cooldown_until - time.time())
         )
     )
 
 
-# ============================================================
+# ==========================================================
 # START BACKGROUND WORKERS
-# ============================================================
+# ==========================================================
 
-# Use exactly one Gunicorn worker and one Railway replica.
-# Do not use Gunicorn --preload.
+# IMPORTANT:
+# Railway replicas = 1
+# Gunicorn workers = 1
+# Do not use --preload.
 
 threading.Thread(
     target=queue_worker,
     daemon=True,
-    name='maq-queue'
+    name="maq-queue"
 ).start()
 
 threading.Thread(
     target=risk_worker,
     daemon=True,
-    name='maq-risk'
+    name="maq-risk"
 ).start()
 
 
-if __name__ == '__main__':
-
+if __name__ == "__main__":
     app.run(
-        host='0.0.0.0',
-        port=int(
-            setting('PORT', 8080)
-        )
+        host="0.0.0.0",
+        port=int(setting("PORT", 8080))
     )
